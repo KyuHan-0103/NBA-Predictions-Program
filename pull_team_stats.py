@@ -9,6 +9,10 @@ Column policy:
     win totals aren't comparable across seasons.
   * Dropped as redundant: W, L, PLUS_MINUS, every *_RANK column, and NET_RATING
     from the advanced stats.
+  * Season-total counting stats (points, rebounds, minutes, possessions, ...) are
+    converted to per-game so they're comparable across seasons of differing length.
+    Rates already invariant to games played (percentages, per-100 ratings, PACE,
+    ratios, PIE) are left untouched.
 """
 
 from __future__ import annotations
@@ -25,9 +29,18 @@ SLEEP_BETWEEN_CALLS = 1.0  # be polite to stats.nba.com
 
 KEYS = ["TEAM_ID", "SEASON"]
 # Redundant raw columns to drop from the base stats (W_PCT is intentionally kept).
-BASE_DROP = ["W", "L", "PLUS_MINUS"]
+BASE_DROP = ["W", "L", "PLUS_MINUS", "FG3_PCT", "FT_PCT", "FG_PCT"]
 # Redundant column to drop from the advanced stats.
-ADVANCED_DROP = ["NET_RATING"]
+ADVANCED_DROP = ["NET_RATING", "E_PACE", "E_OFF_RATING", "E_NET_RATING", "AST_PCT", "REB_PCT", "PACE_PER40", "TS_PCT", "E_DEF_RATING", "PIE"]
+
+# Season-total counting stats that must be divided by games played (GP) to become
+# per-game. Everything not listed here (W_PCT, *_PCT, *_RATING, PACE, PACE_PER40,
+# AST_TO, AST_RATIO, PIE, ...) is already games-played-invariant and left as-is.
+PER_GAME_COLS = [
+    "MIN", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA",
+    "OREB", "DREB", "REB", "AST", "TOV", "STL", "BLK", "BLKA",
+    "PF", "PFD", "PTS", "POSS",
+]
 
 
 def recent_seasons(num_seasons: int, latest_start_year: int) -> list[str]:
@@ -53,6 +66,13 @@ def latest_completed_season_start_year(today: pd.Timestamp) -> int:
 def drop_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Drop every *_RANK column."""
     return df.drop(columns=[c for c in df.columns if c.endswith("_RANK")])
+
+
+def to_per_game(df: pd.DataFrame) -> pd.DataFrame:
+    """Divide season-total counting stats by GP so they're comparable across seasons."""
+    cols = [c for c in PER_GAME_COLS if c in df.columns]
+    df[cols] = df[cols].div(df["GP"], axis=0)
+    return df
 
 
 def fetch_measure(season: str, measure_type: str) -> pd.DataFrame:
@@ -101,6 +121,10 @@ def main() -> None:
 
     # --- Merge on TEAM_ID + SEASON ---
     data = base.merge(adv, on=KEYS, how="inner", validate="one_to_one")
+
+    # --- Convert season-total counting stats to per-game (GP not constant) ---
+    data = to_per_game(data)
+
     data.to_csv(OUTPUT_CSV, index=False)
 
     print(f"\nSaved {len(data)} rows x {data.shape[1]} cols to {OUTPUT_CSV}")
