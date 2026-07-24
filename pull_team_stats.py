@@ -23,7 +23,7 @@ import pandas as pd
 from nba_api.stats.endpoints import leaguedashteamstats
 
 OUTPUT_CSV = "team_season_stats.csv"
-NUM_SEASONS = 10
+NUM_SEASONS = 12
 REQUEST_TIMEOUT = 60  # seconds
 SLEEP_BETWEEN_CALLS = 1.0  # be polite to stats.nba.com
 
