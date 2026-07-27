@@ -13,7 +13,7 @@ REQUIREMENTS:
 
 ARCHITECTURE:
 Program recieves and formats data from nba api
-Model trains on real team's data
+Ridge model trains on real team's data
 Model receives user inputted team
 Stores and consider all player's stats
 Adjusts stats based on usage, intabigles, roster depth, coaching

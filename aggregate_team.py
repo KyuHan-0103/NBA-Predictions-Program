@@ -20,13 +20,21 @@ Method
        the player-sum is ~5x the team value -> divide by 5.
      * DERIVED rates (OFF_RATING, EFG_PCT, AST_TO, AST_RATIO, TM_TOV_PCT, PACE):
        recomputed from the aggregated box-score totals with standard formulas.
-     * OPPONENT-DEPENDENT rates (DEF_RATING, OREB_PCT, DREB_PCT): can't be rebuilt
-       from an offensive box score, so they're approximated from the players' own
-       values. Two sub-cases: rebound *shares* (OREB_PCT/DREB_PCT) -- the five
-       on-court players' individual rates sum to the team's, so they scale up by
-       the ~5 players sharing the floor; DEF_RATING is a team-level rate each
-       player experiences, so it's a minutes-weighted average. These are the
-       softest estimates -- see the validation output.
+     * OPPONENT-DEPENDENT rates (OREB_PCT, DREB_PCT): can't be rebuilt from an
+       offensive box score, so they're approximated from the players' own
+       rebound *shares* -- the five on-court players' individual rates sum to
+       the team's, so they scale up by the ~5 players sharing the floor. This
+       is the softest estimate here -- see the validation output.
+
+DEF_RATING is dropped entirely, not approximated (see "Limitations" in
+README.md). It used to be filled in as a minutes-weighted average of the
+players' own real on-court DEF_RATING, and that measurably beat both
+alternatives tried (a personal-box-score composite, or just dropping it) --
+but only because it borrows real, current-season, opponent-dependent data
+that a genuinely fictional or cross-era roster could never have. Keeping it
+would make the aggregation pipeline's accuracy depend on data the project's
+actual goal (fictional/historic rosters) can't supply, so it's dropped for
+consistency even though that costs some measured accuracy on real rosters.
 
 Validation
 ----------
@@ -48,6 +56,10 @@ TEAM_CSV = "team_season_stats.csv"
 TEAM_DROP_COLS = ["SEASON", "TEAM_ID", "TEAM_NAME", "GP"]
 TEAM_TARGET = "W_PCT"
 GAMES_PER_SEASON = 82  # for expressing W_PCT as a win-loss record
+# Dropped from THIS script's own feature set (see module docstring): real,
+# opponent-dependent, and unavailable for a genuinely fictional/cross-era
+# roster. train_model.py's own real-team model is unaffected by this.
+DEF_TARGET = "DEF_RATING"
 
 MIN_GP = 5              # exclude players with fewer games
 MIN_MPG = 6         # exclude players with fewer minutes per game
@@ -65,12 +77,23 @@ ADDITIVE_COLS = [
 EXPOSURE_COLS = ["POSS"]
 # Rebound shares: the 5 on-court players' individual rates sum to the team's.
 SHARE_COLS = ["OREB_PCT", "DREB_PCT"]
-# Team-level rate each player experiences: minutes-weighted average.
-AVERAGE_COLS = ["DEF_RATING"]
 # Player columns needed from the Advanced measure type (per-game POSS + the rates).
-ADV_KEEP = ["PLAYER_ID", "SEASON", "POSS", "DEF_RATING", "OREB_PCT", "DREB_PCT"]
+# DEF_RATING is deliberately not pulled -- see DEF_TARGET / module docstring.
+ADV_KEEP = ["PLAYER_ID", "SEASON", "POSS", "OREB_PCT", "DREB_PCT"]
 # Counting stats that arrive as season totals and must be divided by GP.
 _PER_GAME = ADDITIVE_COLS + ["MIN", "POSS"]
+# Approximated (not reconstructed from a box score) -- see aggregate_team docstring.
+LOW_CONFIDENCE_COLS = SHARE_COLS
+
+
+def _safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Divide guarding a zero denominator so ratios never produce NaN/inf.
+
+    A zero denominator here means a degenerate roster (e.g. 0 turnovers across
+    the whole team) that real eligibility-filtered rosters won't hit; `default`
+    just keeps the aggregation contract (no NaN/inf) instead of raising.
+    """
+    return float(numerator) / float(denominator) if denominator else default
 
 
 def _fetch(season: str, measure: str) -> pd.DataFrame:
@@ -87,7 +110,7 @@ def _fetch(season: str, measure: str) -> pd.DataFrame:
 
 
 def load_players(season: str) -> pd.DataFrame:
-    """Per-game player stats incl. DEF_RATING/rebound rates (not in the curated CSV)."""
+    """Per-game player stats incl. rebound rates (not in the curated CSV)."""
     base = _fetch(season, "Base")
     time.sleep(SLEEP_BETWEEN_CALLS)
     adv = _fetch(season, "Advanced")
@@ -114,6 +137,8 @@ def aggregate_team(
 
     mpg = players["MIN"].to_numpy(dtype=float)
     total_mpg = mpg.sum()
+    if total_mpg <= 0:
+        raise ValueError("roster has zero total minutes; cannot aggregate")
     scale = total_minutes / total_mpg      # rescale roster minutes to 240
     weights = mpg / total_mpg              # minute share, sums to 1
 
@@ -130,14 +155,17 @@ def aggregate_team(
     # Team minutes are game-minutes (~48), not the 240 player-minutes.
     agg["MIN"] = total_minutes / 5.0
 
-    # Rates derived from the aggregated box-score totals.
-    agg["EFG_PCT"] = (agg["FGM"] + 0.5 * agg["FG3M"]) / agg["FGA"]
-    agg["AST_TO"] = agg["AST"] / agg["TOV"]
+    # Rates derived from the aggregated box-score totals (each guarded against a
+    # zero denominator so the output never contains NaN/inf).
+    agg["EFG_PCT"] = _safe_div(agg["FGM"] + 0.5 * agg["FG3M"], agg["FGA"])
+    agg["AST_TO"] = _safe_div(agg["AST"], agg["TOV"])
     plays = agg["FGA"] + 0.44 * agg["FTA"] + agg["AST"] + agg["TOV"]
-    agg["AST_RATIO"] = 100.0 * agg["AST"] / plays
-    poss_plays = agg["FGA"] + 0.44 * agg["FTA"] + agg["TOV"]
-    agg["TM_TOV_PCT"] = agg["TOV"] / poss_plays  # stored as a fraction, not per-100
-    agg["OFF_RATING"] = 100.0 * agg["PTS"] / agg["POSS"]
+    agg["AST_RATIO"] = _safe_div(100.0 * agg["AST"], plays)
+    #poss_plays = agg["FGA"] + 0.44 * agg["FTA"] + agg["TOV"]
+    # Fraction, not per-100 -- confirmed team_season_stats.csv TM_TOV_PCT is also
+    # a fraction (range ~0.11-0.18), so units agree with this computation.
+    agg["TM_TOV_PCT"] = _safe_div(agg["TOV"], agg["POSS"])
+    agg["OFF_RATING"] = _safe_div(100.0 * agg["PTS"], agg["POSS"])
     agg["PACE"] = agg["POSS"]  # possessions per 48 minutes ~= per-game possessions
 
     # Opponent-dependent rates: approximated from the players' own values.
@@ -146,14 +174,19 @@ def aggregate_team(
     # Rebound shares: the 5 on-court players' individual rates sum to the team's.
     for c in SHARE_COLS:
         agg[c] = float((players[c].to_numpy(dtype=float) * scaled_min).sum()) / team_minutes
-    # Defensive rating: minutes-weighted average of what each player's unit allows.
-    for c in AVERAGE_COLS:
-        agg[c] = float((players[c].to_numpy(dtype=float) * weights).sum())
 
     missing = [c for c in feature_cols if c not in agg]
     if missing:
         raise ValueError(f"aggregation did not produce required features: {missing}")
-    return pd.Series(agg)[feature_cols]
+
+    result = pd.Series(agg, dtype=float)[feature_cols]
+    if not np.isfinite(result.to_numpy()).all():
+        bad = result[~np.isfinite(result.to_numpy())]
+        raise ValueError(f"aggregation produced non-finite values: {bad.to_dict()}")
+    # Not a data column (would violate "nothing extra" in the output contract) --
+    # attrs is pandas' side-channel for exactly this kind of provenance metadata.
+    result.attrs["low_confidence_cols"] = tuple(c for c in LOW_CONFIDENCE_COLS if c in feature_cols)
+    return result
 
 
 def record(wpct: float, games: int = GAMES_PER_SEASON) -> str:
@@ -170,9 +203,25 @@ def compare(agg: pd.Series, real: pd.Series) -> pd.DataFrame:
     return out
 
 
+def error_impact(mape: pd.Series, coefs: pd.Series) -> pd.DataFrame:
+    """Cross per-feature aggregation MAPE with the ridge model's standardized
+    coefficients so error is weighted by how much the model actually cares.
+
+    A feature the aggregation gets badly wrong but the model barely uses (small
+    |coef|) contributes little real prediction error; a feature the model
+    leans on heavily (large |coef|) is dangerous even at modest MAPE. `impact`
+    (mape_pct * |coef|) approximates that real, prediction-facing error.
+    """
+    out = pd.DataFrame({"mape_pct": mape, "coef": coefs, "abs_coef": coefs.abs()})
+    out["impact"] = out["mape_pct"] * out["abs_coef"]
+    return out.sort_values("impact", ascending=False)
+
+
 def main() -> None:
     teams_all = pd.read_csv(TEAM_CSV)
-    feature_cols = [c for c in teams_all.columns if c not in TEAM_DROP_COLS + [TEAM_TARGET]]
+    # DEF_RATING excluded here (not from train_model.py's own feature set) --
+    # see DEF_TARGET / module docstring.
+    feature_cols = [c for c in teams_all.columns if c not in TEAM_DROP_COLS + [TEAM_TARGET, DEF_TARGET]]
     season = sorted(teams_all["SEASON"].unique())[-1]  # current season
     teams = teams_all[teams_all["SEASON"] == season].set_index("TEAM_ID")
 
@@ -221,12 +270,23 @@ def main() -> None:
     with pd.option_context("display.float_format", lambda v: f"{v:.2f}"):
         print(mape.to_string())
     print(f"\nOverall mean abs % error: {mape.mean():.2f}%")
+    low_conf = agg_line.attrs.get("low_confidence_cols", ())
+    print(f"Low-confidence (approximated, not box-score-derived): {', '.join(low_conf)}")
 
     # --- Run both lines through the ridge model: predicted win records ---
     # Train on prior seasons only, so current-season predictions are out-of-sample.
     train_df = teams_all[teams_all["SEASON"] != season]
     model = build_model()
     model.fit(train_df[feature_cols], train_df[TEAM_TARGET])
+
+    # --- Cross per-feature MAPE with ridge sensitivity: the "real" error ---
+    # A feature's raw MAPE alone is misleading -- what matters is how much the
+    # model's win-rate prediction actually moves per unit of that error.
+    coefs = pd.Series(model.named_steps["ridgecv"].coef_, index=feature_cols)
+    impact = error_impact(mape, coefs)
+    print("\n=== MAPE x ridge coefficient: real error impact (desc) ===")
+    with pd.option_context("display.float_format", lambda v: f"{v:.4f}"):
+        print(impact.to_string())
 
     pred_real = float(model.predict(real_line.to_frame().T)[0])
     pred_agg = float(model.predict(agg_line.to_frame().T)[0])
