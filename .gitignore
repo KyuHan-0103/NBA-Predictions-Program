@@ -1,3 +1,5 @@
 .venv/
 team_season_stats.csv
+player_history_stats.csv
+player_all_seasons.csv
 __pycache__/

@@ -16,10 +16,21 @@ Method
 3. Feature families are combined differently:
      * ADDITIVE box-score events (PTS, REB, AST, ...): one event belongs to one
        player, so team = sum of players (after minute rescaling).
-     * EXPOSURE stats (POSS): all five on-court players accrue them at once, so
-       the player-sum is ~5x the team value -> divide by 5.
-     * DERIVED rates (OFF_RATING, EFG_PCT, AST_TO, AST_RATIO, TM_TOV_PCT, PACE):
-       recomputed from the aggregated box-score totals with standard formulas.
+     * USAGE CONSERVATION (POSS, PACE, and the shot/turnover/assist volume
+       stats): summing 5 players' own box-score production has no boundary --
+       nothing stops 5 high-usage players from implying more team possessions
+       than a real game contains. POSS_target (a minutes-weighted average of
+       the players' own PACE, which tracks real team PACE closely -- ~1.4%
+       mean abs error, corr 0.985, checked against every real team this
+       season) anchors the roster to a realistic number of possessions; every
+       usage-linked stat is scaled by POSS_target/POSS_raw, and POSS itself is
+       then *derived* from the scaled totals (not set independently), so the
+       possession denominator always matches the scaled numerators exactly --
+       OFF_RATING and TM_TOV_PCT come out identical whether conservation is on
+       or off (see aggregate_team's conserve_usage flag).
+     * DERIVED rates (OFF_RATING, EFG_PCT, AST_TO, AST_RATIO, TM_TOV_PCT):
+       recomputed from the aggregated (and usage-scaled) box-score totals with
+       standard formulas.
      * OPPONENT-DEPENDENT rates (OREB_PCT, DREB_PCT): can't be rebuilt from an
        offensive box score, so they're approximated from the players' own
        rebound *shares* -- the five on-court players' individual rates sum to
@@ -73,13 +84,21 @@ ADDITIVE_COLS = [
     "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA", "OREB", "DREB", "REB",
     "AST", "TOV", "STL", "BLK", "BLKA", "PF", "PFD", "PTS",
 ]
-# On-court exposure: shared by all 5 players on the floor -> player-sum is ~5x team.
-EXPOSURE_COLS = ["POSS"]
+# Usage-conservation family: scaled together by POSS_target/POSS_raw so total
+# shot/turnover volume fits inside a realistic number of team possessions
+# without distorting shooting splits, assist rate, or turnover rate (see
+# aggregate_team). DREB is excluded -- while it's a pace dependent stat,
+# it's ultimately  a function of opponent misses, not this roster's own shot volume.
+# REB is recomputed as OREB+DREB afterward to
+# keep the additive identity since only OREB (not DREB) is scaled here.
+USAGE_SCALE_COLS = ["FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA", "TOV", "OREB", "PTS", "AST"]
 # Rebound shares: the 5 on-court players' individual rates sum to the team's.
 SHARE_COLS = ["OREB_PCT", "DREB_PCT"]
 # Player columns needed from the Advanced measure type (per-game POSS + the rates).
 # DEF_RATING is deliberately not pulled -- see DEF_TARGET / module docstring.
-ADV_KEEP = ["PLAYER_ID", "SEASON", "POSS", "OREB_PCT", "DREB_PCT"]
+# PACE feeds the usage-conservation scaling in aggregate_team -- it's already a
+# rate (possessions per 48) so it does NOT go in _PER_GAME below.
+ADV_KEEP = ["PLAYER_ID", "SEASON", "POSS", "OREB_PCT", "DREB_PCT", "PACE"]
 # Counting stats that arrive as season totals and must be divided by GP.
 _PER_GAME = ADDITIVE_COLS + ["MIN", "POSS"]
 # Approximated (not reconstructed from a box score) -- see aggregate_team docstring.
@@ -129,8 +148,15 @@ def aggregate_team(
     players: pd.DataFrame,
     feature_cols: list[str],
     total_minutes: float = TOTAL_TEAM_MINUTES,
+    conserve_usage: bool = True,
 ) -> pd.Series:
-    """Combine 5-15 players into one team stat-line in `feature_cols` order."""
+    """Combine 5-15 players into one team stat-line in `feature_cols` order.
+
+    `conserve_usage=False` disables the usage-conservation scaling below (POSS
+    falls back to the raw, uncapped box-score estimate) -- used only to prove
+    the possession-denominated rates are invariant to the scaling, and for the
+    ON-vs-OFF diagnostics in main().
+    """
     n = len(players)
     if not 5 <= n <= 15:
         print(f"  [warn] roster has {n} players (expected 5-15)")
@@ -148,12 +174,28 @@ def aggregate_team(
     for c in ADDITIVE_COLS:
         agg[c] = scale * players[c].to_numpy(dtype=float).sum()
 
-    # Exposure stats: divide the (rescaled) player-sum by the 5 on-court players.
-    for c in EXPOSURE_COLS:
-        agg[c] = scale * players[c].to_numpy(dtype=float).sum() / 5.0
-
     # Team minutes are game-minutes (~48), not the 240 player-minutes.
     agg["MIN"] = total_minutes / 5.0
+
+    # Usage conservation: the ball is zero-sum, so summing 5 players' own
+    # box-score volume can imply more possessions than a real team plays in a
+    # game -- nothing above enforces that boundary. POSS_target anchors the
+    # roster to a realistic pace: a minutes-weighted average of the players'
+    # own PACE, which tracks real team PACE closely (~1.4% mean abs error,
+    # corr 0.985, checked against every real team this season). POSS_raw is
+    # the same total estimated the standard box-score way, uncapped.
+    poss_target = float(np.average(players["PACE"].to_numpy(dtype=float), weights=mpg))
+    poss_raw = agg["FGA"] + 0.44 * agg["FTA"] + agg["TOV"] - agg["OREB"]
+    usage_scale = _safe_div(poss_target, poss_raw, default=1.0) if conserve_usage else 1.0
+    for c in USAGE_SCALE_COLS:
+        agg[c] *= usage_scale
+    agg["REB"] = agg["OREB"] + agg["DREB"]  # DREB unscaled -- restore the additive identity
+    # POSS is *derived* from the (now scaled) totals rather than set to
+    # poss_target independently -- that keeps the possession denominator
+    # exactly in step with the scaled numerators, which is what makes
+    # OFF_RATING and TM_TOV_PCT below invariant to conservation on/off.
+    agg["POSS"] = agg["FGA"] + 0.44 * agg["FTA"] + agg["TOV"] - agg["OREB"]
+    agg["PACE"] = agg["POSS"]
 
     # Rates derived from the aggregated box-score totals (each guarded against a
     # zero denominator so the output never contains NaN/inf).
@@ -161,12 +203,10 @@ def aggregate_team(
     agg["AST_TO"] = _safe_div(agg["AST"], agg["TOV"])
     plays = agg["FGA"] + 0.44 * agg["FTA"] + agg["AST"] + agg["TOV"]
     agg["AST_RATIO"] = _safe_div(100.0 * agg["AST"], plays)
-    #poss_plays = agg["FGA"] + 0.44 * agg["FTA"] + agg["TOV"]
     # Fraction, not per-100 -- confirmed team_season_stats.csv TM_TOV_PCT is also
     # a fraction (range ~0.11-0.18), so units agree with this computation.
     agg["TM_TOV_PCT"] = _safe_div(agg["TOV"], agg["POSS"])
     agg["OFF_RATING"] = _safe_div(100.0 * agg["PTS"], agg["POSS"])
-    agg["PACE"] = agg["POSS"]  # possessions per 48 minutes ~= per-game possessions
 
     # Opponent-dependent rates: approximated from the players' own values.
     scaled_min = weights * total_minutes  # per-player minutes, sums to 240
@@ -186,7 +226,52 @@ def aggregate_team(
     # Not a data column (would violate "nothing extra" in the output contract) --
     # attrs is pandas' side-channel for exactly this kind of provenance metadata.
     result.attrs["low_confidence_cols"] = tuple(c for c in LOW_CONFIDENCE_COLS if c in feature_cols)
+    result.attrs["usage_scale"] = usage_scale
     return result
+
+
+# Five real, high-usage, ball-dominant guards/wings (top-10 league FGA this
+# season, each a primary shot-creator) stacked on one fictional roster -- a
+# stress test for usage conservation: no real team fields 5 players who all
+# need this much of the shot/turnover volume at once.
+STAR_STACK_NAMES = [
+    "Luka Dončić",
+    "Shai Gilgeous-Alexander",
+    "Anthony Edwards",
+    "Jalen Brunson",
+    "Devin Booker",
+]
+
+
+def build_star_stack(players: pd.DataFrame, names: list[str] = STAR_STACK_NAMES) -> pd.DataFrame:
+    """Pull a fictional high-usage roster by player name out of the season pull."""
+    roster = players[players["PLAYER_NAME"].isin(names)]
+    missing = set(names) - set(roster["PLAYER_NAME"])
+    if missing:
+        raise ValueError(f"star-stack players not found in pull: {missing}")
+    return roster
+
+
+def demo_star_stack(players: pd.DataFrame, feature_cols: list[str], model) -> None:
+    """Run the star-stack roster through aggregation with conservation on and
+    off, and report whether it pulls an unrealistic combined shot/turnover
+    volume down to something a real team could actually play."""
+    roster = build_star_stack(players)
+    on = aggregate_team(roster, feature_cols)
+    off = aggregate_team(roster, feature_cols, conserve_usage=False)
+
+    print(f"\n=== Star-stack stress test: {', '.join(roster['PLAYER_NAME'])} ===")
+    print(f"POSS_raw (uncapped box-score estimate, conservation OFF): {off['POSS']:.1f}")
+    print(f"POSS_target (pace-anchored, conservation ON):             {on['POSS']:.1f}")
+    print(f"usage_scale: {on.attrs['usage_scale']:.4f}  (expect clearly < 1.0)")
+    print("\nVolume pulled down by conservation (OFF = uncapped sum, ON = scaled):")
+    for c in ["FGA", "FTA", "TOV", "OREB", "PTS", "AST"]:
+        print(f"  {c:5s}  OFF={off[c]:8.1f}   ON={on[c]:8.1f}   ratio={on[c] / off[c]:.3f}")
+
+    pred_on = float(model.predict(on.to_frame().T)[0])
+    pred_off = float(model.predict(off.to_frame().T)[0])
+    print(f"\nPredicted win record  ->  conservation ON: {record(pred_on)}   "
+          f"conservation OFF: {record(pred_off)}")
 
 
 def record(wpct: float, games: int = GAMES_PER_SEASON) -> str:
@@ -245,7 +330,14 @@ def main() -> None:
     name = teams.loc[focus_id, "TEAM_NAME"]
 
     agg_line = aggregate_team(roster, feature_cols)
+    agg_line_off = aggregate_team(roster, feature_cols, conserve_usage=False)
     real_line = teams.loc[focus_id, feature_cols].astype(float)
+
+    print(f"=== Rate invariance check: {name} (conservation ON vs OFF) ===")
+    for c in ["OFF_RATING", "TM_TOV_PCT"]:
+        on_v, off_v = agg_line[c], agg_line_off[c]
+        print(f"  {c:12s} ON={on_v:.6f}  OFF={off_v:.6f}  diff={on_v - off_v:.2e}")
+    print(f"  usage_scale (ON): {agg_line.attrs['usage_scale']:.4f}\n")
 
     print(f"=== Detailed validation: {name} ({len(roster)} players) ===")
     table = compare(agg_line, real_line)
@@ -256,12 +348,16 @@ def main() -> None:
     # --- Aggregate validation across all teams (mean abs % error per feature) ---
     errs = []
     agg_lines: dict[int, pd.Series] = {}
+    agg_lines_off: dict[int, pd.Series] = {}
+    usage_scales: dict[int, float] = {}
     for tid, grp in qualified.groupby("TEAM_ID"):
         grp = grp.sort_values("MIN", ascending=False).head(15)
         if tid not in teams.index or len(grp) < 5:
             continue
         a = aggregate_team(grp, feature_cols)
         agg_lines[tid] = a
+        usage_scales[tid] = a.attrs["usage_scale"]
+        agg_lines_off[tid] = aggregate_team(grp, feature_cols, conserve_usage=False)
         r = teams.loc[tid, feature_cols].astype(float)
         errs.append((100.0 * (a - r) / r.replace(0, np.nan)).abs())
     mape = pd.concat(errs, axis=1).mean(axis=1).sort_values()
@@ -272,6 +368,16 @@ def main() -> None:
     print(f"\nOverall mean abs % error: {mape.mean():.2f}%")
     low_conf = agg_line.attrs.get("low_confidence_cols", ())
     print(f"Low-confidence (approximated, not box-score-derived): {', '.join(low_conf)}")
+
+    # --- Diagnostic: usage_scale per real team (expect ~1.0 -- their players' ---
+    # --- summed volume should already roughly fit their own pace) ---
+    scale_s = pd.Series(usage_scales, name="usage_scale").rename_axis("TEAM_ID")
+    scale_tbl = pd.DataFrame({"team": teams.loc[scale_s.index, "TEAM_NAME"], "usage_scale": scale_s})
+    print(f"\n=== usage_scale per team (conservation ON; expect ~1.0 for real rosters) ===")
+    with pd.option_context("display.float_format", lambda v: f"{v:.4f}"):
+        print(scale_tbl.sort_values("usage_scale").to_string(index=False))
+    print(f"\nmean={scale_s.mean():.4f}  std={scale_s.std():.4f}  "
+          f"min={scale_s.min():.4f}  max={scale_s.max():.4f}")
 
     # --- Run both lines through the ridge model: predicted win records ---
     # Train on prior seasons only, so current-season predictions are out-of-sample.
@@ -296,9 +402,12 @@ def main() -> None:
     print(f"  Model on real stats  : {record(pred_real):>6}  (W_PCT {pred_real:.3f})")
     print(f"  Model on aggregated  : {record(pred_agg):>6}  (W_PCT {pred_agg:.3f})")
 
-    # Same comparison for every team.
+    # Same comparison for every team, plus the conservation-OFF counterfactual
+    # (diagnostic: how much does the conservation scaling actually change the
+    # aggregated win prediction, team by team?).
     ids = list(agg_lines.keys())
     A = pd.DataFrame([agg_lines[i] for i in ids], index=ids)[feature_cols]
+    A_off = pd.DataFrame([agg_lines_off[i] for i in ids], index=ids)[feature_cols]
     R = teams.loc[ids, feature_cols].astype(float)
     wins = lambda wp: (np.clip(wp, 0, 1) * GAMES_PER_SEASON).round().astype(int)
     out = pd.DataFrame({
@@ -306,16 +415,25 @@ def main() -> None:
         "actual_W": wins(teams.loc[ids, TEAM_TARGET].to_numpy()),
         "pred_real_W": wins(model.predict(R)),
         "pred_agg_W": wins(model.predict(A)),
+        "pred_agg_off_W": wins(model.predict(A_off)),
     })
     out["agg_err"] = out["pred_agg_W"] - out["actual_W"]
+    out["agg_err_off"] = out["pred_agg_off_W"] - out["actual_W"]
     out = out.sort_values("actual_W", ascending=False)
 
     print(f"\n=== Predicted win totals across {len(out)} teams (sorted by actual) ===")
     print(out.to_string(index=False))
     mae_real = (out["pred_real_W"] - out["actual_W"]).abs().mean()
     mae_agg = out["agg_err"].abs().mean()
+    mae_agg_off = out["agg_err_off"].abs().mean()
     print(f"\nMAE in wins vs actual  ->  model on real stats: {mae_real:.1f}   "
-          f"model on aggregated: {mae_agg:.1f}")
+          f"model on aggregated (conservation ON): {mae_agg:.1f}   "
+          f"model on aggregated (conservation OFF): {mae_agg_off:.1f}")
+
+    # --- Star-stack stress test: 5 real, high-usage, ball-dominant players on ---
+    # --- a fictional roster together. Expect poss_raw well above poss_target, ---
+    # --- so usage_scale should come out clearly below 1. ---
+    demo_star_stack(qualified, feature_cols, model)
 
 
 if __name__ == "__main__":

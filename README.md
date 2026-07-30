@@ -8,33 +8,41 @@ using machine learning.
 **v1 (working):** Predicts a *real* NBA team's season win rate from that team's
 per-game stats, evaluated honestly on seasons the model never trained on.
 
-**Planned (not yet built):** Accept a user-created *fictional* roster of 5–15
-players (present or historic), aggregate those players into a team-level
-statistical profile, and predict the team's record — eventually accounting for
-role/fit, roster depth, and coaching. Cross-era rosters will require era
-adjustment. See "Limitations & next steps."
+**v2 (working):** Build a fictional 5–15 player roster interactively by name
+and season (present or historic, 1996-97 onward), aggregate it into a
+team-level statistical profile, and predict its record over an 82-game season.
+
+**Planned (not yet built):** Accounting for role/fit, roster depth, coaching,
+and era adjustment for cross-era rosters. See "Limitations & next steps."
 
 ## Features
 
 **Now**
 - Pulls team-level stats (Base + Advanced) from the NBA Stats API via `nba_api`
-- Cleans and formats the data into one row per team per season
+- Pulls player-level stats (Base + Advanced) for every season since 1996-97
+- Cleans and formats the data into one row per team (or player) per season
 - Trains and compares two models (ridge regression, gradient boosting)
 - Evaluates on unseen seasons and reports accuracy in wins
+- Interactively builds a fictional roster by player name + season (or that
+  player's statistically best, "Prime" season), validating each pick
+- Aggregates a validated roster into a team stat-line and predicts its record
 
 **Planned**
-- Accept user-built rosters (5–15 players), with an optional coach
+- Optional coach, and adjustments for role/fit and roster depth
 - Adjust user-built rosters to operate without fatigue or injury
-- Support historic players via era adjustment
-- Roster → team-profile aggregation (usage, minutes, fit)
+- Era adjustment so cross-era rosters are placed on a common scale
 
 ## Project structure
 
 | File | Purpose |
 |------|---------|
 | `pull_team_stats.py` | Pulls Base + Advanced team stats, merges on TEAM_ID + SEASON, converts counting stats to per-game, writes `team_season_stats.csv`. Data only — no modeling. |
+| `pull_player_seasons_all.py` | Pulls Base + Advanced player stats for every season since 1996-97 (the first with real Advanced data), converts counting stats to per-game, writes `player_all_seasons.csv`. Data only — no modeling. |
 | `train_model.py` | Loads the CSV, splits by season, trains ridge and gradient boosting on an identical split, prints a comparison table and each model's top drivers. |
+| `aggregate_team.py` | Combines 5–15 players' per-game stats into one team stat-line in `train_model.py`'s exact feature shape, and validates the aggregation against every real team's actual roster. |
+| `predict_fictional_roster.py` | Interactive CLI: builds a 5–15 player fictional roster by name + season, validates each pick, aggregates it, and predicts its 82-game record. |
 | `team_season_stats.csv` | Generated data (git-ignored). |
+| `player_all_seasons.csv` | Generated data (git-ignored). |
 | `requirements.txt` | Dependencies. |
 | `SPEC.md` | Full project specification. |
 
@@ -45,8 +53,10 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-python pull_team_stats.py         # fetch data -> team_season_stats.csv
-python train_model.py             # train + compare models
+python pull_team_stats.py           # fetch team data -> team_season_stats.csv
+python pull_player_seasons_all.py   # fetch player data -> player_all_seasons.csv
+python train_model.py               # train + compare models
+python predict_fictional_roster.py  # build a fictional roster -> predicted record
 ```
 
 ## Configuration
@@ -56,6 +66,7 @@ Knobs live at the top of each script:
 - `NUM_SEASONS` — how many seasons to pull (`pull_team_stats.py`)
 - `N_TEST_SEASONS` — how many recent seasons to hold out for testing (`train_model.py`)
 - `ALPHAS` — ridge penalty grid searched by cross-validation
+- `MIN_ROSTER` / `MAX_ROSTER` — roster size bounds, 5–15 (`predict_fictional_roster.py`)
 
 ## Methodology
 
@@ -79,6 +90,31 @@ tested on the most recent seasons it has never seen. This mirrors real
 forecasting (predicting a season before it happens) and avoids the mild leakage
 of a random split, where the same team's adjacent seasons could straddle the
 train/test line.
+
+**Roster input — one (player, season) pair at a time.** `predict_fictional_roster.py`
+looks players up against every player-season pulled since 1996-97 (see next
+section for why that's the floor). The same player from two different
+seasons is deliberately treated as two different, separately selectable roster
+entries — 2019-20 Stephen Curry and 2022-23 Stephen Curry are not
+interchangeable — because the underlying stat lines genuinely differ and the
+project's own goal is letting a roster mix players across eras/seasons.
+
+**"Prime" season — highest PIE among eligible seasons.** PIE (Player Impact
+Estimate) is stats.nba.com's own single-number, box-score-derived summary of a
+player's per-game impact, already available from the same Advanced pull used
+elsewhere — a "best season" definition that needs no extra computation or
+external data. It's restricted to *eligible* seasons only (the same GP/MIN
+filter `aggregate_team.py` requires), so a small-sample outlier (e.g. a
+5-game, injury-shortened stretch) can't become a player's "Prime" by
+statistical accident. This is a heuristic, not an all-things-considered
+judgment of a player's best season — see Limitations.
+
+**Player-season data floor — 1996-97.** Confirmed empirically (not assumed):
+querying `nba_api`'s Advanced player measure type for any season before
+1996-97 returns zero rows, not zeroed or garbage columns — a clean cutoff, not
+a silent-failure trap. This is a different (and safer) floor than
+`pull_player_history.py`'s 2013-14 tracking-stat floor, where pre-2013-14
+seasons instead silently return every tracking column as 0.0.
 
 ## Results
 
@@ -116,8 +152,24 @@ More data helps a complex model generalize, but not enough to justify it here.
 - **No ground truth for the end goal.** Fictional cross-era teams never played,
   so their predictions are informed estimates that cannot be directly verified.
   The model can only be *graded* on real teams.
-- **Planned builds:** player-level data → roster-to-team aggregation (validated
-  against real teams first) → era adjustment for historic players.
+- **No era adjustment yet.** A cross-era roster's stats are used exactly as
+  each player produced them in their own season — a 1996-97 pace/rules
+  environment sits on the same scale as 2025-26 in the aggregation, with no
+  normalization between them. Planned next.
+- **"Prime" is a box-score heuristic, not a judgment call.** Ranking eligible
+  seasons by PIE will sometimes disagree with the season most people would
+  call a player's peak (e.g. a lower-PIE season with a signature playoff run,
+  or a role change that suppressed box-score stats without reducing impact).
+  It's reproducible and needs no outside data, not a claim of being
+  definitive.
+- **Name lookup is literal, not fuzzy.** `predict_fictional_roster.py` matches
+  on exact (case/diacritic-insensitive) or substring name matches only; a
+  misspelling that isn't a substring of the real name won't resolve, and two
+  players sharing a name requires picking from a numbered list.
+- **Traded-player seasons reflect only the final team stint.** Same caveat as
+  `pull_player_history.py`: `nba_api`'s season totals for a player traded
+  mid-season cover only their time with the team they finished the season on,
+  not a combined line.
 - **DEF_RATING has no honest analogue for a fictional roster.** OFF_RATING can
 be reconstructed from an aggregated box score (points ÷ possessions);
 DEF_RATING can't, since it's opponent-dependent — nothing in a roster's own
