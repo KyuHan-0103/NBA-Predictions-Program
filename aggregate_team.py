@@ -67,6 +67,19 @@ TEAM_CSV = "team_season_stats.csv"
 TEAM_DROP_COLS = ["SEASON", "TEAM_ID", "TEAM_NAME", "GP"]
 TEAM_TARGET = "W_PCT"
 GAMES_PER_SEASON = 82  # for expressing W_PCT as a win-loss record
+
+# --- 5-man lineup validation (pull_lineups.py / pull_player_seasons_all.py) ---
+LINEUP_CSV = "lineup_season_stats.csv"
+PLAYER_SEASONS_CSV = "player_all_seasons.csv"
+LINEUP_PLAYER_ID_COLS = [f"PLAYER_ID_{i + 1}" for i in range(5)]
+# Total-season possessions floor for a lineup to count as ground truth here.
+# Chosen from pull_lineups.py's printed distribution (23,470 lineup-seasons,
+# 2014-15..2025-26): the median lineup-season has only ~45 total possessions
+# (most rosters run dozens of small-sample bench combinations), while 250
+# sits around the 95th percentile -- roughly each team's handful of
+# most-used units per season. Below 250, a "lineup" is mostly a few-game
+# garbage-time cameo, not a real rotation unit worth validating against.
+LINEUP_POSS_FLOOR = 250
 # Dropped from THIS script's own feature set (see module docstring): real,
 # opponent-dependent, and unavailable for a genuinely fictional/cross-era
 # roster. train_model.py's own real-team model is unaffected by this.
@@ -288,18 +301,152 @@ def compare(agg: pd.Series, real: pd.Series) -> pd.DataFrame:
     return out
 
 
-def error_impact(mape: pd.Series, coefs: pd.Series) -> pd.DataFrame:
-    """Cross per-feature aggregation MAPE with the ridge model's standardized
-    coefficients so error is weighted by how much the model actually cares.
+def error_impact_deprecated(mape: pd.Series, coefs: pd.Series) -> pd.DataFrame:
+    """DEPRECATED -- see perturbation_impact() for the replacement.
 
-    A feature the aggregation gets badly wrong but the model barely uses (small
-    |coef|) contributes little real prediction error; a feature the model
-    leans on heavily (large |coef|) is dangerous even at modest MAPE. `impact`
-    (mape_pct * |coef|) approximates that real, prediction-facing error.
+    Crosses per-feature aggregation MAPE with the ridge model's standardized
+    coefficients (mape_pct * |coef|) as a proxy for prediction-facing error.
+    This is unreliable when features are collinear with offsetting
+    coefficients: PACE and POSS correlate at ~0.99 here but carry large
+    coefficients of opposite sign (PACE ~-0.29, POSS ~+0.13), so either
+    coefficient's magnitude alone overstates how much *that feature's* error
+    actually moves a prediction -- some of it is cancelled by the other.
+    Kept only so its ranking can be printed alongside perturbation_impact()'s
+    for comparison; do not use this to decide which aggregation error matters.
     """
     out = pd.DataFrame({"mape_pct": mape, "coef": coefs, "abs_coef": coefs.abs()})
     out["impact"] = out["mape_pct"] * out["abs_coef"]
     return out.sort_values("impact", ascending=False)
+
+
+def perturbation_impact(
+    model,
+    real_lines: pd.DataFrame,
+    mape: pd.Series,
+    feature_cols: list[str],
+) -> pd.DataFrame:
+    """Rank features by how much perturbing them actually moves the model's
+    predicted win rate -- a direct replacement for error_impact_deprecated().
+
+    For each feature, and for each of the 30 real teams in `real_lines`, that
+    team's real stat line is perturbed by the aggregation's measured MAPE for
+    that feature (both +MAPE% and -MAPE%, one feature at a time, all others
+    held at their real value), re-predicted with the already-fitted `model`,
+    and the change in predicted wins (delta W_PCT * 82) is recorded. The
+    table reports, per feature, the mean (over both directions and all 30
+    teams) of the absolute win-count change -- this is what "the model
+    actually cares" should mean, instead of a standardized-coefficient proxy
+    that collinearity can make misleading (see error_impact_deprecated()).
+
+    Known limitation: this is a one-at-a-time perturbation, which assumes
+    each feature's aggregation error is independent of the others' -- that
+    assumption is false here. PACE, POSS, FGA, and PTS errors all originate
+    in the same usage-scaling step (see aggregate_team()'s conserve_usage
+    scaling), so in practice they move together, not independently, and this
+    diagnostic cannot capture that correlated, simultaneous error. Treat it
+    as a per-feature sensitivity ranking, not a bound on the aggregation's
+    real combined error.
+    """
+    X = real_lines[feature_cols]
+    baseline = model.predict(X)
+    rows = []
+    for feat in feature_cols:
+        frac = mape[feat] / 100.0
+        X_plus, X_minus = X.copy(), X.copy()
+        X_plus[feat] = X[feat] * (1.0 + frac)
+        X_minus[feat] = X[feat] * (1.0 - frac)
+        delta_plus = (model.predict(X_plus) - baseline) * GAMES_PER_SEASON
+        delta_minus = (model.predict(X_minus) - baseline) * GAMES_PER_SEASON
+        mean_abs_win_impact = np.mean((np.abs(delta_plus) + np.abs(delta_minus)) / 2.0)
+        rows.append({"feature": feat, "mape_pct": mape[feat], "mean_abs_win_impact": mean_abs_win_impact})
+    return pd.DataFrame(rows).set_index("feature").sort_values("mean_abs_win_impact", ascending=False)
+
+
+def load_lineups(poss_floor: float = LINEUP_POSS_FLOOR) -> pd.DataFrame:
+    """Real 5-man lineups (from pull_lineups.py) clearing `poss_floor`
+    season-total possessions -- see LINEUP_POSS_FLOOR for why."""
+    lineups = pd.read_csv(LINEUP_CSV)
+    total_poss = lineups["POSS"] * lineups["GP"]
+    return lineups.loc[total_poss >= poss_floor].copy()
+
+
+def validate_against_lineups(feature_cols: list[str]) -> tuple[pd.Series, dict]:
+    """5-man ground-truth validation, as a counterpart to main()'s 15-man
+    team-level validation.
+
+    For each real 5-man lineup clearing LINEUP_POSS_FLOOR, look up its five
+    players' own per-game season stats (player_all_seasons.csv), run them
+    through aggregate_team() exactly as predict_fictional_roster.py would,
+    and compare the synthetic line to the lineup's own real, observed line.
+    Every qualifying lineup actually played those possessions together, so
+    its OFF_RATING/DEF_RATING/box score are ground truth in a way the 15-man
+    validation isn't: a real team's top-15 by minutes is a rotation shape,
+    not the 5-player roster shape this program is actually asked to score.
+
+    A lineup is skipped (never silently included with a bad input) when:
+      * one of its 5 players has no row in player_all_seasons.csv for that
+        season (shouldn't happen inside the pulled range; checked
+        defensively rather than assumed);
+      * a player's season-long row belongs to a different TEAM_ID than the
+        lineup's -- the traded-player caveat documented in
+        pull_player_seasons_all.py means that row reflects only the player's
+        *other* stint, not the one this lineup was actually part of;
+      * any of the 5 players fails aggregate_team's own eligibility filter
+        (GP >= MIN_GP, MIN >= MIN_MPG) -- the aggregation contract's own
+        input precondition.
+
+    Returns (weighted_mape, summary): `weighted_mape` is per-feature mean
+    absolute % error weighted by each lineup's season-total possessions (a
+    more heavily-sampled lineup counts more); `summary` reports how many
+    lineups were considered, used, and skipped for each reason above.
+    """
+    lineups = load_lineups()
+    players_all = pd.read_csv(PLAYER_SEASONS_CSV)
+    player_idx = players_all.set_index(["PLAYER_ID", "SEASON"])
+
+    errs: list[pd.Series] = []
+    weights: list[float] = []
+    n_skipped_missing = 0
+    n_skipped_traded = 0
+    n_skipped_ineligible = 0
+
+    for _, row in lineups.iterrows():
+        season = row["SEASON"]
+        team_id = row["TEAM_ID"]
+        player_ids = [int(row[c]) for c in LINEUP_PLAYER_ID_COLS]
+
+        keys = [(pid, season) for pid in player_ids]
+        if not all(k in player_idx.index for k in keys):
+            n_skipped_missing += 1
+            continue
+        roster = player_idx.loc[keys].reset_index()
+
+        if (roster["TEAM_ID"] != team_id).any():
+            n_skipped_traded += 1
+            continue
+
+        eligible = filter_players(roster)
+        if len(eligible) < 5:
+            n_skipped_ineligible += 1
+            continue
+
+        agg = aggregate_team(eligible, feature_cols)
+        real = row[feature_cols].astype(float)
+        errs.append((100.0 * (agg - real) / real.replace(0, np.nan)).abs())
+        weights.append(float(row["POSS"] * row["GP"]))  # season-total possessions
+
+    err_df = pd.concat(errs, axis=1)
+    w = np.array(weights)
+    weighted_mape = err_df.apply(lambda r: np.average(r, weights=w), axis=1).sort_values()
+
+    summary = {
+        "lineups_considered": len(lineups),
+        "lineups_used": len(errs),
+        "skipped_missing_player_season": n_skipped_missing,
+        "skipped_traded_team_mismatch": n_skipped_traded,
+        "skipped_ineligible_player": n_skipped_ineligible,
+    }
+    return weighted_mape, summary
 
 
 def main() -> None:
@@ -385,14 +532,43 @@ def main() -> None:
     model = build_model()
     model.fit(train_df[feature_cols], train_df[TEAM_TARGET])
 
-    # --- Cross per-feature MAPE with ridge sensitivity: the "real" error ---
-    # A feature's raw MAPE alone is misleading -- what matters is how much the
-    # model's win-rate prediction actually moves per unit of that error.
+    # ids/R (every qualifying team's real line) are needed by perturbation_impact()
+    # below and reused later for the full team-by-team prediction table.
+    ids = list(agg_lines.keys())
+    R = teams.loc[ids, feature_cols].astype(float)
+
+    # --- Two rankings of "real" per-feature error impact, for comparison ---
+    # error_impact_deprecated: mape_pct * |standardized ridge coef| -- unreliable
+    # under collinearity (see its docstring). perturbation_impact: actually
+    # perturbs each feature by its measured MAPE and re-predicts, averaged over
+    # all 30 teams -- the direct replacement.
     coefs = pd.Series(model.named_steps["ridgecv"].coef_, index=feature_cols)
-    impact = error_impact(mape, coefs)
-    print("\n=== MAPE x ridge coefficient: real error impact (desc) ===")
+    impact_old = error_impact_deprecated(mape, coefs)
+    impact_new = perturbation_impact(model, R, mape, feature_cols)
+
+    print("\n=== [DEPRECATED] MAPE x ridge coefficient: real error impact (desc) ===")
     with pd.option_context("display.float_format", lambda v: f"{v:.4f}"):
-        print(impact.to_string())
+        print(impact_old.to_string())
+
+    print("\n=== Perturbation test: mean abs win impact per feature (desc) ===")
+    with pd.option_context("display.float_format", lambda v: f"{v:.4f}"):
+        print(impact_new.to_string())
+
+    # --- Where the two rankings disagree ---
+    rank_cmp = pd.DataFrame({
+        "old_rank": impact_old["impact"].rank(ascending=False),
+        "new_rank": impact_new["mean_abs_win_impact"].rank(ascending=False),
+    })
+    rank_cmp["rank_diff"] = (rank_cmp["old_rank"] - rank_cmp["new_rank"]).abs()
+    disagreements = rank_cmp.sort_values("rank_diff", ascending=False).head(8)
+    print("\n=== Biggest ranking disagreements (old vs. perturbation) ===")
+    print(disagreements.to_string())
+    print(
+        "Expect PACE/POSS to disagree most: their ~0.99 correlation and offsetting\n"
+        "coefficients (PACE ~-0.29, POSS ~+0.13) let the deprecated method's\n"
+        "coefficient-magnitude proxy overstate/understate impact that the\n"
+        "perturbation test measures directly."
+    )
 
     pred_real = float(model.predict(real_line.to_frame().T)[0])
     pred_agg = float(model.predict(agg_line.to_frame().T)[0])
@@ -404,11 +580,9 @@ def main() -> None:
 
     # Same comparison for every team, plus the conservation-OFF counterfactual
     # (diagnostic: how much does the conservation scaling actually change the
-    # aggregated win prediction, team by team?).
-    ids = list(agg_lines.keys())
+    # aggregated win prediction, team by team?). ids/R computed above.
     A = pd.DataFrame([agg_lines[i] for i in ids], index=ids)[feature_cols]
     A_off = pd.DataFrame([agg_lines_off[i] for i in ids], index=ids)[feature_cols]
-    R = teams.loc[ids, feature_cols].astype(float)
     wins = lambda wp: (np.clip(wp, 0, 1) * GAMES_PER_SEASON).round().astype(int)
     out = pd.DataFrame({
         "team": teams.loc[ids, "TEAM_NAME"].to_numpy(),
@@ -429,6 +603,56 @@ def main() -> None:
     print(f"\nMAE in wins vs actual  ->  model on real stats: {mae_real:.1f}   "
           f"model on aggregated (conservation ON): {mae_agg:.1f}   "
           f"model on aggregated (conservation OFF): {mae_agg_off:.1f}")
+
+    # --- 5-man lineup validation: ground truth for the roster shape (5-15,
+    # --- most often 5) this program is actually asked to score, vs. the
+    # --- 15-man team-rotation shape validated above. ---
+    lineup_mape, lineup_summary = validate_against_lineups(feature_cols)
+    print(f"\n=== 5-man lineup validation (POSS floor >= {LINEUP_POSS_FLOOR}) ===")
+    print(f"Lineups considered: {lineup_summary['lineups_considered']}  |  "
+          f"used: {lineup_summary['lineups_used']}  |  "
+          f"skipped (missing player-season): {lineup_summary['skipped_missing_player_season']}  |  "
+          f"skipped (traded/team mismatch): {lineup_summary['skipped_traded_team_mismatch']}  |  "
+          f"skipped (ineligible player): {lineup_summary['skipped_ineligible_player']}")
+    print("\nPOSS-weighted mean abs % error per feature (5-man, asc):")
+    with pd.option_context("display.float_format", lambda v: f"{v:.2f}"):
+        print(lineup_mape.to_string())
+    print(f"\nOverall POSS-weighted mean abs % error (5-man): {lineup_mape.mean():.2f}%")
+    print(
+        "\nNote: MIN, every additive box-score total, and POSS show triple-digit\n"
+        "% error here -- not a bug. aggregate_team() rescales a roster's combined\n"
+        "minutes to TOTAL_TEAM_MINUTES (240 = an entire 48-minute game), the\n"
+        "deliberate SPEC.md premise that a fictional 5-15 player roster plays a\n"
+        "full game uninterrupted. A real 5-man lineup's own recorded line is the\n"
+        "opposite: only the ~15-20 partial minutes/game that exact five shared\n"
+        "the floor before a substitution -- a real team always plays many\n"
+        "different 5-man units across 48 minutes, never one unit for all of it.\n"
+        "Those two bases aren't commensurable for any total that scales with\n"
+        "minutes played (PTS, FGA, AST, ... and POSS, which aggregate_team.py\n"
+        "derives as a full-48-minute-equivalent count here, not the lineup's own\n"
+        "partial-floor-time count). Only genuinely rate-like columns -- OFF_RATING,\n"
+        "EFG_PCT, AST_TO, AST_RATIO, TM_TOV_PCT, OREB_PCT, DREB_PCT, PACE -- are\n"
+        "minutes-scale-invariant and stay meaningfully comparable (single digits\n"
+        "to ~20%), which is why they're the ones worth reading from this table."
+    )
+
+    # --- Where 15-man (team-rotation) and 5-man (this program's actual use
+    # --- case) validation disagree: a feature that aggregates well at 15
+    # --- players but badly at 5 matters more, since 5 is the shape the
+    # --- program is most often asked about. The 15-man validation doesn't
+    # --- surface the minutes-basis mismatch above because a real team's
+    # --- top-15 by minutes already sums to ~240 total minutes on its own
+    # --- (usage_scale ~= 1.0), so the rescale is nearly a no-op there. ---
+    shape_cmp = pd.DataFrame({"mape_15man": mape, "mape_5man": lineup_mape})
+    shape_cmp["diff_5_minus_15"] = shape_cmp["mape_5man"] - shape_cmp["mape_15man"]
+    print("\n=== 15-man vs. 5-man validation: biggest disagreements (desc |diff|) ===")
+    with pd.option_context("display.float_format", lambda v: f"{v:.2f}"):
+        print(shape_cmp.reindex(shape_cmp["diff_5_minus_15"].abs().sort_values(ascending=False).index).head(10).to_string())
+    print(
+        "Positive diff_5_minus_15 = the feature aggregates *worse* for a 5-man\n"
+        "unit than for a 15-man rotation -- the case CLAUDE.md flags as mattering\n"
+        "more, since 5 is the roster size this program is actually asked about."
+    )
 
     # --- Star-stack stress test: 5 real, high-usage, ball-dominant players on ---
     # --- a fictional roster together. Expect poss_raw well above poss_target, ---
