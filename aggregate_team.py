@@ -383,6 +383,24 @@ def validate_against_lineups(feature_cols: list[str]) -> tuple[pd.Series, dict]:
     validation isn't: a real team's top-15 by minutes is a rotation shape,
     not the 5-player roster shape this program is actually asked to score.
 
+    Same-minutes-basis rescale: aggregate_team()'s output represents a full,
+    uninterrupted 48-minute team game (its default TOTAL_TEAM_MINUTES). A real
+    lineup's own recorded line covers only the partial minutes/game it
+    actually shared the floor (row["MIN"], e.g. ~15-20) before a substitution
+    -- comparing the two raw would mostly measure that basis mismatch, not
+    aggregation fidelity. So every count that scales with floor time (MIN,
+    the box-score totals in ADDITIVE_COLS, and POSS) is scaled up by
+    48/row["MIN"] before comparing -- extrapolating "what this lineup's own
+    box score would look like over a full 48 minutes at its own on-court
+    rate," the same target quantity aggregate_team() is built to produce.
+    Rate/percentage/rating columns (OFF_RATING, EFG_PCT, AST_TO, AST_RATIO,
+    TM_TOV_PCT, OREB_PCT, DREB_PCT, PACE) are already invariant to floor time
+    and are left as-is. (Passing a matching total_minutes into aggregate_team
+    instead would fix the box-score totals but not POSS/PACE, which
+    aggregate_team derives from PACE -- already a per-48-minutes quantity --
+    independent of total_minutes; rescaling the real line fixes both in one
+    step.)
+
     A lineup is skipped (never silently included with a bad input) when:
       * one of its 5 players has no row in player_all_seasons.csv for that
         season (shouldn't happen inside the pulled range; checked
@@ -393,7 +411,10 @@ def validate_against_lineups(feature_cols: list[str]) -> tuple[pd.Series, dict]:
         *other* stint, not the one this lineup was actually part of;
       * any of the 5 players fails aggregate_team's own eligibility filter
         (GP >= MIN_GP, MIN >= MIN_MPG) -- the aggregation contract's own
-        input precondition.
+        input precondition;
+      * the lineup's own recorded MIN is <= 0 (shouldn't happen for a lineup
+        with recorded possessions; checked defensively rather than assumed,
+        since it's the divisor for the 48-minute rescale above).
 
     Returns (weighted_mape, summary): `weighted_mape` is per-feature mean
     absolute % error weighted by each lineup's season-total possessions (a
@@ -404,11 +425,17 @@ def validate_against_lineups(feature_cols: list[str]) -> tuple[pd.Series, dict]:
     players_all = pd.read_csv(PLAYER_SEASONS_CSV)
     player_idx = players_all.set_index(["PLAYER_ID", "SEASON"])
 
+    # Columns whose value scales with how long the lineup was actually on the
+    # floor -- rescaled to a 48-minute-equivalent basis below (see docstring).
+    # Everything else in feature_cols is already a rate/percentage/rating.
+    scale_to_48 = [c for c in feature_cols if c in ADDITIVE_COLS or c in ("MIN", "POSS")]
+
     errs: list[pd.Series] = []
     weights: list[float] = []
     n_skipped_missing = 0
     n_skipped_traded = 0
     n_skipped_ineligible = 0
+    n_skipped_zero_minutes = 0
 
     for _, row in lineups.iterrows():
         season = row["SEASON"]
@@ -430,10 +457,22 @@ def validate_against_lineups(feature_cols: list[str]) -> tuple[pd.Series, dict]:
             n_skipped_ineligible += 1
             continue
 
+        if row["MIN"] <= 0:
+            n_skipped_zero_minutes += 1
+            continue
+
         agg = aggregate_team(eligible, feature_cols)
-        real = row[feature_cols].astype(float)
+
+        # Rescale the lineup's own (partial-floor-time) line up to a
+        # 48-minute-equivalent basis so it's commensurable with `agg`.
+        real = row[feature_cols].astype(float).copy()
+        factor = 48.0 / float(row["MIN"])
+        real[scale_to_48] = real[scale_to_48] * factor
+
         errs.append((100.0 * (agg - real) / real.replace(0, np.nan)).abs())
-        weights.append(float(row["POSS"] * row["GP"]))  # season-total possessions
+        # Sample-size weight uses the lineup's real (unscaled) season-total
+        # possessions, not the 48-minute extrapolation used for comparison.
+        weights.append(float(row["POSS"] * row["GP"]))
 
     err_df = pd.concat(errs, axis=1)
     w = np.array(weights)
@@ -445,6 +484,7 @@ def validate_against_lineups(feature_cols: list[str]) -> tuple[pd.Series, dict]:
         "skipped_missing_player_season": n_skipped_missing,
         "skipped_traded_team_mismatch": n_skipped_traded,
         "skipped_ineligible_player": n_skipped_ineligible,
+        "skipped_zero_minutes": n_skipped_zero_minutes,
     }
     return weighted_mape, summary
 
@@ -613,28 +653,13 @@ def main() -> None:
           f"used: {lineup_summary['lineups_used']}  |  "
           f"skipped (missing player-season): {lineup_summary['skipped_missing_player_season']}  |  "
           f"skipped (traded/team mismatch): {lineup_summary['skipped_traded_team_mismatch']}  |  "
-          f"skipped (ineligible player): {lineup_summary['skipped_ineligible_player']}")
-    print("\nPOSS-weighted mean abs % error per feature (5-man, asc):")
+          f"skipped (ineligible player): {lineup_summary['skipped_ineligible_player']}  |  "
+          f"skipped (zero minutes): {lineup_summary['skipped_zero_minutes']}")
+    print("\nPOSS-weighted mean abs % error per feature, both rescaled to a common\n"
+          "48-minute basis before comparing (5-man, asc) -- see validate_against_lineups():")
     with pd.option_context("display.float_format", lambda v: f"{v:.2f}"):
         print(lineup_mape.to_string())
     print(f"\nOverall POSS-weighted mean abs % error (5-man): {lineup_mape.mean():.2f}%")
-    print(
-        "\nNote: MIN, every additive box-score total, and POSS show triple-digit\n"
-        "% error here -- not a bug. aggregate_team() rescales a roster's combined\n"
-        "minutes to TOTAL_TEAM_MINUTES (240 = an entire 48-minute game), the\n"
-        "deliberate SPEC.md premise that a fictional 5-15 player roster plays a\n"
-        "full game uninterrupted. A real 5-man lineup's own recorded line is the\n"
-        "opposite: only the ~15-20 partial minutes/game that exact five shared\n"
-        "the floor before a substitution -- a real team always plays many\n"
-        "different 5-man units across 48 minutes, never one unit for all of it.\n"
-        "Those two bases aren't commensurable for any total that scales with\n"
-        "minutes played (PTS, FGA, AST, ... and POSS, which aggregate_team.py\n"
-        "derives as a full-48-minute-equivalent count here, not the lineup's own\n"
-        "partial-floor-time count). Only genuinely rate-like columns -- OFF_RATING,\n"
-        "EFG_PCT, AST_TO, AST_RATIO, TM_TOV_PCT, OREB_PCT, DREB_PCT, PACE -- are\n"
-        "minutes-scale-invariant and stay meaningfully comparable (single digits\n"
-        "to ~20%), which is why they're the ones worth reading from this table."
-    )
 
     # --- Where 15-man (team-rotation) and 5-man (this program's actual use
     # --- case) validation disagree: a feature that aggregates well at 15

@@ -218,24 +218,36 @@ stats are run through `aggregate_team()` and compared to the lineup's real
 line, weighted by possessions (827 of 1,005 qualifying lineups used; 178
 skipped for the traded-player caveat — a player's `player_all_seasons.csv`
 row reflects only their final team of the season, which can differ from the
-lineup's team). *Evidence:* rate-like features (OFF_RATING, EFG_PCT, AST_TO,
-AST_RATIO, TM_TOV_PCT, OREB_PCT, DREB_PCT, PACE) validate about as well as at
-15-man (single digits to ~20% weighted MAPE). Every additive box-score total,
-plus POSS, balloons to 300-460% weighted MAPE — not a bug: `aggregate_team()`
-rescales a roster to `TOTAL_TEAM_MINUTES` (240 = a full, uninterrupted
-48-minute game), the deliberate premise (see SPEC.md) that a fictional 5-15
-player roster plays the whole game without substitution. A real 5-man
-lineup's own recorded line is the opposite — only the ~15-20 partial
-minutes/game that exact five actually shared the floor before a substitution,
-since a real team always rotates through many different 5-man units across
-48 minutes. Those two bases aren't commensurable for anything that scales
-with minutes played. The 15-man validation never surfaces this because a
-real team's top-15-by-minutes roster already sums to ~240 combined minutes
-on its own (`usage_scale` ≈ 1.0 there), making the rescale nearly a no-op —
-it only bites at the roster size (5) this program actually predicts.
-*Decision:* no aggregation code change from this finding alone; documented
-as a limitation below, since it changes what a fictional prediction should
-be trusted for.
+lineup's team). *First pass, naive comparison:* rate-like features
+(OFF_RATING, EFG_PCT, AST_TO, AST_RATIO, TM_TOV_PCT, OREB_PCT, DREB_PCT, PACE)
+validated fine (single digits to ~20% weighted MAPE), but every additive
+box-score total, plus POSS, ballooned to 300-460% weighted MAPE. Root cause:
+`aggregate_team()` rescales a roster to `TOTAL_TEAM_MINUTES` (240 = a full,
+uninterrupted 48-minute game — SPEC.md's deliberate premise that a fictional
+roster plays the whole game without substitution), while a real 5-man
+lineup's own recorded line covers only the ~15-20 partial minutes/game that
+exact five actually shared the floor before a substitution — two bases that
+aren't commensurable for anything that scales with minutes played. The
+15-man validation never surfaced this because a real team's top-15-by-minutes
+roster already sums to ~240 combined minutes on its own (`usage_scale` ≈ 1.0
+there), making the rescale nearly a no-op — it only bites at the roster size
+(5) this program actually predicts. *Fix:* rather than change
+`aggregate_team()`'s total-minutes assumption (which would fix the box-score
+totals but not POSS/PACE — `aggregate_team()` derives POSS from PACE, already
+a per-48-minutes quantity independent of total minutes), `validate_against_lineups()`
+rescales the real lineup's own line up to a 48-minute-equivalent basis
+(`48 / row["MIN"]`) before comparing — extrapolating "what this lineup's own
+box score would look like over a full 48 minutes at its own on-court rate,"
+the same quantity `aggregate_team()` is built to produce. Rate/percentage
+columns are left as-is (already floor-time-invariant). *Evidence after the
+fix:* overall weighted MAPE dropped from **276.70% to 10.33%**; POSS now
+tracks PACE closely (1.81% vs. 1.72%), confirming both are on the same basis.
+FTM, FTA, BLKA, PFD, and BLK still validate meaningfully worse at 5-man than
+15-man (~18-24% vs. ~3-6%) — these are exactly the lower-frequency events
+(free throws, blocks) where a 5-player sample is noisiest, a real remaining
+signal rather than a units artifact. *Decision:* **rescale integrated** into
+`validate_against_lineups()`; see Limitations for what the residual 5-man-vs-
+15-man gap in low-frequency stats means for a fictional prediction.
 
 ## Limitations & next steps
 
@@ -262,18 +274,21 @@ be trusted for.
   simple regularized model is the right call.
 - **Coaching / intangibles.** In the SPEC's scope but not built; they belong on
   top of a validated statistical core, not inside it.
-- **A fictional prediction's counting-stat totals aren't literal at 5 players.**
-  `aggregate_team()`'s full-48-minute-game rescale (SPEC.md's deliberate "no
-  substitutions" premise) means a fictional 5-player roster's aggregated
-  PTS/FGA/AST/etc. represent that five playing an entire game uninterrupted —
-  something no real 5-man lineup ever does, since real teams always rotate
-  through many units across 48 minutes. Validating against real 5-man
-  lineups' own recorded lines (see Test log) confirms every additive
-  box-score total and POSS are off by 300-460% on this basis, while the
-  minutes-invariant rate features (OFF_RATING, EFG_PCT, TM_TOV_PCT, AST_TO,
-  AST_RATIO, OREB_PCT, DREB_PCT, PACE) remain meaningfully accurate. Read a
-  fictional roster's predicted *efficiency/rate profile*, not its aggregated
-  counting-stat totals, as the trustworthy part of the output.
+- **5-man validation rests on a linear 48-minute extrapolation.** Comparing
+  `aggregate_team()`'s output (a full, uninterrupted 48-minute game) to a real
+  5-man lineup's own recorded line (only its actual ~15-20 partial minutes/game)
+  requires putting both on the same basis — `validate_against_lineups()` does
+  this by scaling the real lineup's line up by `48 / MIN` (see Test log). That
+  extrapolation assumes the lineup's own on-court rate would hold linearly
+  across a full game; a real lineup's rate reflects fatigue, opponent
+  adjustments, and matchup-specific chemistry over its actual (short) run,
+  none of which necessarily holds at 4x-plus the minutes. With that rescale in
+  place, overall weighted MAPE is ~10%, and low-frequency box-score events
+  (FTM, FTA, BLKA, PFD, BLK — free throws and blocks) still validate
+  meaningfully worse at 5-man (~18-24%) than 15-man (~3-6%), consistent with a
+  smaller sample amplifying noise in rarer events. Read a fictional 5-player
+  roster's predicted free-throw and block volume with more caution than its
+  shooting/scoring/rebounding totals.
 - **Perturbation-test limitation.** `perturbation_impact()` (see Test log)
   perturbs one feature at a time, assuming independent aggregation errors.
   That's false here — PACE, POSS, FGA, and PTS errors all originate in the
