@@ -44,7 +44,7 @@ isn't re-litigated later.
 | `train_model.py` | Loads the team CSV, splits by season, trains the ridge win-rate model, prints metrics and standardized coefficients (the model's top drivers). |
 | `aggregate_team.py` | Aggregates 5–15 players into one team stat-line (possession conservation, DEF_RATING dropped), and self-validates by rebuilding every real team from its own roster. |
 | `predict_fictional_roster.py` | Interactive roster builder (by player + season); aggregates and scores the roster with the ridge model. |
-| `player_efficiency.py` | **Standalone, not integrated.** Fits and tests the usage→efficiency (USG%→TS%) response model. Kept as a documented experiment. |
+| `usage_efficiency_model.py` | **Standalone, not integrated.** Fits and tests the usage→efficiency (USG%→TS%) response model. Kept as a documented experiment. |
 | `SPEC.md` | Full project specification. |
 | `CLAUDE.md` | Working agreements, incl. the aggregation contract. |
 
