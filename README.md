@@ -57,6 +57,7 @@ pip install -r requirements.txt
 
 python pull_team_stats.py            # team data     -> team_season_stats.csv
 python pull_player_seasons_all.py    # player pool    -> player_all_seasons.csv
+python pull_lineups.py               # 5 man lineups  -> lineup_season_stats.csv
 python train_model.py                # train + report the real-team model
 python aggregate_team.py             # aggregation + real-team validation
 python predict_fictional_roster.py   # build a roster and predict its record
@@ -69,7 +70,7 @@ Knobs live at the top of each script:
 - `NUM_SEASONS` — how many seasons of team data to pull (`pull_team_stats.py`)
 - `N_TEST_SEASONS` — recent seasons held out for testing (`train_model.py`)
 - `ALPHAS` — ridge penalty grid searched by cross-validation
-- `MIN_GP`, `MIN_MPG` — player eligibility thresholds (`aggregate_team.py`)
+- `MIN_GP`, `MIN_MPG` — player eligibility thresholds derived from graphs in docs (`aggregate_team.py`)
 
 ## Methodology
 
