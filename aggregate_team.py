@@ -35,7 +35,21 @@ Method
        offensive box score, so they're approximated from the players' own
        rebound *shares* -- the five on-court players' individual rates sum to
        the team's, so they scale up by the ~5 players sharing the floor. This
-       is the softest estimate here -- see the validation output.
+       is the softest estimate here -- see the validation output. Nothing in
+       that sum knows about 1.0 as a ceiling, so these two are clipped into
+       [0, 1] and the clip is reported (see CLIPPABLE_PCT_COLS).
+
+Which features
+--------------
+All 27 -- the same set train_model.py fits, DEF_RATING excluded. A reduced,
+rates-and-defence-only set of 12 was built and tested for this path, on the
+argument that collinear coefficients which only cancel in combination are
+unsafe on an extrapolated row. It did fix the coefficient signs, and it made
+the aggregated-roster predictions measurably worse (7.7 -> 12.9 wins MAE),
+because pruning the well-aggregated counting stats concentrates the model's
+weight onto the two opponent-dependent rebound shares this file approximates
+worst. Rejected on that evidence; see README's Test log. The sign caveat it was
+built to address is real and remains -- coefficient_signs() prints it.
 
 DEF_RATING is dropped entirely, not approximated (see "Limitations" in
 README.md). It used to be filled in as a minutes-weighted average of the
@@ -56,6 +70,16 @@ The per-feature error-impact diagnostics (perturbation_impact() and the
 deprecated MAPE x coefficient ranking) live in perturbation_tests.py. main()
 below still runs and prints them exactly as before, via
 run_perturbation_tests(); that file can also be run on its own.
+
+Stress rosters
+--------------
+STRESS_ROSTERS scores five deliberately lopsided rosters -- ball-dominant
+guards, centres, low-usage role players, short shooters, and a balanced five as
+the reference -- built from prime seasons in player_all_seasons.csv. Each
+prints usage_scale, the predicted record with its interval, the extrapolation
+ratio, and the three features contributing most to the predicted log-odds.
+EXPECTED_STRESS_ORDER states the expected ordering *before* the run, so a
+disagreement is a finding rather than an observation.
 """
 
 from __future__ import annotations
@@ -66,7 +90,16 @@ import numpy as np
 import pandas as pd
 from nba_api.stats.endpoints import leaguedashplayerstats
 
-from train_model import build_model, extrapolation_report, fit_extrapolation_guard
+from train_model import (
+    build_model,
+    extrapolation_ratio,
+    extrapolation_report,
+    fit_extrapolation_guard,
+    holdout_logit_residual_sd,
+    interval_report,
+    logodds_contributions,
+    ridge_step,
+)
 
 TEAM_CSV = "team_season_stats.csv"
 TEAM_DROP_COLS = ["SEASON", "TEAM_ID", "TEAM_NAME", "GP"]
@@ -109,9 +142,23 @@ ADDITIVE_COLS = [
 # it's ultimately  a function of opponent misses, not this roster's own shot volume.
 # REB is recomputed as OREB+DREB afterward to
 # keep the additive identity since only OREB (not DREB) is scaled here.
-USAGE_SCALE_COLS = ["FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA", "TOV", "OREB", "PTS", "AST"]
+USAGE_SCALE_COLS = ["FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA", "TOV", "OREB", "PTS", "AST", "PFD"]
 # Rebound shares: the 5 on-court players' individual rates sum to the team's.
 SHARE_COLS = ["OREB_PCT", "DREB_PCT"]
+# AGGREGATION_CONTRACT.md: every *_PCT output must be a fraction in [0, 1].
+# Two kinds of *_PCT column come out of this function and they fail differently:
+#   * SHARE_COLS are opponent-dependent APPROXIMATIONS -- a minutes-weighted sum
+#     of the five players' own rebound rates, with nothing in that sum aware of
+#     1.0 as a ceiling. A roster of five bigs comes out claiming more defensive
+#     rebounds than the opponent misses shots. That is the approximation being
+#     pushed past where it holds, not a coding error, so these are CLIPPED and
+#     the clip is recorded in the output's attrs (a clipped line is a weaker
+#     line, and a caller has to be able to tell).
+#   * Every other *_PCT (EFG_PCT, TM_TOV_PCT) is recomputed from this roster's
+#     own aggregated box score and cannot leave [0, 1] unless the formula or its
+#     inputs are wrong. Those RAISE. Clipping them would convert a bug into a
+#     plausible-looking number and leave the extrapolation report to notice.
+CLIPPABLE_PCT_COLS = tuple(SHARE_COLS)
 # Player columns needed from the Advanced measure type (per-game POSS + the rates).
 # DEF_RATING is deliberately not pulled -- see DEF_TARGET / module docstring.
 # PACE feeds the usage-conservation scaling in aggregate_team -- it's already a
@@ -122,6 +169,38 @@ _PER_GAME = ADDITIVE_COLS + ["MIN", "POSS"]
 # Approximated (not reconstructed from a box score) -- see aggregate_team docstring.
 LOW_CONFIDENCE_COLS = SHARE_COLS
 
+# Expected coefficient signs, for annotation only -- nothing here is asserted.
+# +1 / -1 / None = "no defensible prior". A reduced, rates-and-defence-only
+# feature set was tested precisely to make these come out right and was
+# rejected: it fixed the signs and made the aggregated-roster predictions
+# measurably worse (README Test log). So the model that scores rosters is the
+# same 27-feature fit train_model.py reports on, and several of its
+# coefficients read backwards -- OFF_RATING at -0.88, AST at -0.34, TOV at
+# +0.34 -- because collinear features carry offsetting values that cancel in
+# combination. That is a real caveat on every roster prediction, so it is
+# printed with each coefficient rather than left to be rediscovered.
+EXPECTED_SIGNS = {
+    "OFF_RATING": +1,   # more points per possession
+    "EFG_PCT": +1,      # more points per shot
+    "TM_TOV_PCT": -1,   # possessions ended with no shot
+    "DREB_PCT": +1,     # a larger share of the opponent's misses
+    "OREB_PCT": +1,     # second chances -- but traded against transition defence
+    "AST_RATIO": +1,    # ball movement -- but also a style marker, not only quality
+    "STL": +1,          # ends a possession -- but also proxies gambling defence
+    "BLK": +1,          # ends a possession -- fits at -0.009 here
+    "BLKA": -1,         # your own shot blocked: a possession spent for nothing
+    "PF": -1,           # free points conceded -- but correlated with the aggression
+                        # that produces the STL and BLK already in the model
+    "PFD": +1,          # free points drawn -- but also a usage/style marker
+    "PTS": +1,          # scoring
+    "AST": +1,          # ball movement
+    "TOV": -1,          # giving the ball away -- but its *rate* is already a
+                        # feature, so the count acts as a possessions proxy
+    "OREB": +1,         # second chances
+    "DREB": +1,         # ending the opponent's possession
+    "PACE": None,       # good and bad teams both play fast
+}
+
 
 def _safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
     """Divide guarding a zero denominator so ratios never produce NaN/inf.
@@ -131,6 +210,46 @@ def _safe_div(numerator: float, denominator: float, default: float = 0.0) -> flo
     just keeps the aggregation contract (no NaN/inf) instead of raising.
     """
     return float(numerator) / float(denominator) if denominator else default
+
+
+def _clip_pct_columns(line: pd.Series) -> dict[str, float]:
+    """Clip the approximated *_PCT columns into [0, 1], in place.
+
+    Returns {column: pre-clip value} for the columns the clip actually moved --
+    empty when nothing fired, which is the common case. See CLIPPABLE_PCT_COLS
+    for why only those columns are eligible.
+    """
+    fired: dict[str, float] = {}
+    for c in CLIPPABLE_PCT_COLS:
+        if c not in line.index:
+            continue
+        raw = float(line[c])
+        clipped = min(max(raw, 0.0), 1.0)
+        if clipped != raw:
+            fired[c] = raw
+            line[c] = clipped
+    return fired
+
+
+def _check_pct_range(line: pd.Series) -> None:
+    """Postcondition: no *_PCT feature leaves [0, 1]. Raises if one does.
+
+    Runs after _clip_pct_columns, so anything it catches is a column that was
+    never eligible for clipping -- i.e. a derived rate whose formula or inputs
+    are wrong. Failing here is the point: the alternative is a wrong percentage
+    travelling into a prediction and being noticed, if at all, as an unexplained
+    extrapolation ratio.
+    """
+    bad = {
+        c: float(v) for c, v in line.items()
+        if c.endswith("_PCT") and not 0.0 <= float(v) <= 1.0
+    }
+    if bad:
+        raise ValueError(
+            f"aggregation violated the *_PCT in [0, 1] postcondition: {bad}. "
+            f"Columns eligible for clipping are {list(CLIPPABLE_PCT_COLS)}; anything "
+            f"else out of range is a formula or units bug, not an approximation."
+        )
 
 
 def _fetch(season: str, measure: str) -> pd.DataFrame:
@@ -160,6 +279,42 @@ def filter_players(players: pd.DataFrame) -> pd.DataFrame:
     """Drop players below the games / minutes-per-game thresholds."""
     keep = (players["GP"] >= MIN_GP) & (players["MIN"] >= MIN_MPG)
     return players.loc[keep].copy()
+
+
+# --- The 1996-97-onward player pool (roster input, and the stress rosters) ----
+# These three live here rather than in predict_fictional_roster.py because the
+# stress rosters below need the same eligibility rule that tool applies at input
+# time, and the aggregation contract's precondition should have exactly one
+# definition. predict_fictional_roster.py imports them from here.
+_ADV_CHECK_COLS = ["MIN", "POSS", "PACE", "OREB_PCT", "DREB_PCT", "PIE"]
+
+
+def load_player_pool(csv_path: str = PLAYER_SEASONS_CSV) -> pd.DataFrame:
+    try:
+        return pd.read_csv(csv_path, dtype={"SEASON": str})
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{csv_path} not found -- run `python pull_player_seasons_all.py` first."
+        ) from exc
+
+
+def eligible_mask(pool: pd.DataFrame) -> pd.Series:
+    """filter_players' GP/MIN thresholds plus the NaN/inf/all-zero guard the
+    aggregation contract requires of every input row."""
+    vals = pool[_ADV_CHECK_COLS].to_numpy(dtype=float)
+    finite = np.isfinite(vals).all(axis=1)
+    not_all_zero = (vals != 0).any(axis=1)
+    thresholds = (pool["GP"] >= MIN_GP) & (pool["MIN"] >= MIN_MPG)
+    return thresholds & finite & not_all_zero
+
+
+def prime_season_row(pool_elig: pd.DataFrame, player_id) -> pd.Series | None:
+    """The eligible season with the highest PIE -- a heuristic, not an era- or
+    pace-adjusted "best season" judgment (see README Limitations)."""
+    rows = pool_elig[pool_elig["PLAYER_ID"] == player_id]
+    if rows.empty:
+        return None
+    return rows.loc[rows["PIE"].idxmax()]
 
 
 def aggregate_team(
@@ -241,11 +396,39 @@ def aggregate_team(
     if not np.isfinite(result.to_numpy()).all():
         bad = result[~np.isfinite(result.to_numpy())]
         raise ValueError(f"aggregation produced non-finite values: {bad.to_dict()}")
+    pct_clipped = _clip_pct_columns(result)
+    _check_pct_range(result)
     # Not a data column (would violate "nothing extra" in the output contract) --
     # attrs is pandas' side-channel for exactly this kind of provenance metadata.
     result.attrs["low_confidence_cols"] = tuple(c for c in LOW_CONFIDENCE_COLS if c in feature_cols)
     result.attrs["usage_scale"] = usage_scale
+    # {column: pre-clip value} for every *_PCT the clip moved; empty dict when the
+    # line came out clean. Truthiness is the "was this line clipped" test, and the
+    # values are kept so a caller can say by how much the approximation overshot.
+    result.attrs["pct_clipped"] = pct_clipped
     return result
+
+
+def coefficient_signs(model, feature_cols: list[str]) -> pd.DataFrame:
+    """Standardized coefficients with each one's expected sign annotated.
+
+    Printed, never asserted. `expected` is the prior from EXPECTED_SIGNS ('+',
+    '-', or '?') and `agrees` is whether the fitted sign matched; features with
+    no defensible prior (PACE) get None. Eight of the sixteen priced features
+    disagree, which is a property of this model worth seeing on every run: the
+    coefficients are individually wrong and only correct in combination, and a
+    roster is the row where the combination stops holding (see the module
+    docstring and README's Limitations).
+    """
+    coefs = pd.Series(ridge_step(model).coef_, index=feature_cols)
+    symbol = {1: "+", -1: "-", None: "?"}
+    expected = [EXPECTED_SIGNS.get(c) for c in feature_cols]
+    return pd.DataFrame({
+        "logit_coef": coefs,
+        "expected": [symbol[e] for e in expected],
+        "agrees": [None if e is None else bool(np.sign(v) == e)
+                   for v, e in zip(coefs, expected)],
+    }).sort_values("logit_coef", key=np.abs, ascending=False)
 
 
 # Five real, high-usage, ball-dominant guards/wings (top-10 league FGA this
@@ -271,7 +454,11 @@ def build_star_stack(players: pd.DataFrame, names: list[str] = STAR_STACK_NAMES)
 
 
 def demo_star_stack(
-    players: pd.DataFrame, feature_cols: list[str], model, guard: dict | None = None
+    players: pd.DataFrame,
+    feature_cols: list[str],
+    model,
+    guard: dict | None = None,
+    logit_sd: float | None = None,
 ) -> None:
     """Run the star-stack roster through aggregation with conservation on and
     off, and report whether it pulls an unrealistic combined shot/turnover
@@ -285,8 +472,14 @@ def demo_star_stack(
     correctly, where an impossible number spoke for itself.
     """
     roster = build_star_stack(players)
+    # Two aggregations of the same roster: the full feature set for the volume
+    # table (FGA/PTS/... are not in the fictional set), and `model`'s own
+    # columns for the prediction.
     on = aggregate_team(roster, feature_cols)
     off = aggregate_team(roster, feature_cols, conserve_usage=False)
+    score_cols = list(model.feature_names_in_)
+    on_s = aggregate_team(roster, score_cols)
+    off_s = aggregate_team(roster, score_cols, conserve_usage=False)
 
     print(f"\n=== Star-stack stress test: {', '.join(roster['PLAYER_NAME'])} ===")
     print(f"POSS_raw (uncapped box-score estimate, conservation OFF): {off['POSS']:.1f}")
@@ -296,15 +489,166 @@ def demo_star_stack(
     for c in ["FGA", "FTA", "TOV", "OREB", "PTS", "AST"]:
         print(f"  {c:5s}  OFF={off[c]:8.1f}   ON={on[c]:8.1f}   ratio={on[c] / off[c]:.3f}")
 
-    pred_on = float(model.predict(on.to_frame().T)[0])
-    pred_off = float(model.predict(off.to_frame().T)[0])
+    pred_on = float(model.predict(on_s.to_frame().T)[0])
+    pred_off = float(model.predict(off_s.to_frame().T)[0])
     print(f"\nPredicted win record  ->  conservation ON: {record(pred_on)}   "
           f"conservation OFF: {record(pred_off)}")
     print(f"  (raw W_PCT  ON: {pred_on:.3f}   OFF: {pred_off:.3f}  -- both inside (0, 1) "
           f"by construction now; see train_model.py)")
 
     if guard is not None:
-        print("\n" + extrapolation_report(guard, on, pred_on))
+        print("\n" + extrapolation_report(guard, on_s, pred_on))
+        if logit_sd is not None:
+            print(interval_report(pred_on, logit_sd,
+                                  guard_ratio=extrapolation_ratio(guard, on_s)))
+
+
+# --------------------------------------------------------------------------
+# Stress rosters
+# --------------------------------------------------------------------------
+# Four shapes the aggregation should handle differently, each built from
+# player_all_seasons.csv prime seasons (highest-PIE eligible season), plus a
+# balanced five as the reference point. demo_star_stack() above covers the same
+# five ball-dominant guards on their *current* season lines; these are the
+# cross-era version, and the other four shapes are new.
+STRESS_ROSTERS: dict[str, list[str]] = {
+    # Reference shape: one primary creator, a secondary scorer, a two-way wing,
+    # a two-way big, a rim-protecting centre. What a team is supposed to be.
+    "balanced five": [
+        "Stephen Curry", "Klay Thompson", "Kawhi Leonard", "Tim Duncan", "Rudy Gobert",
+    ],
+    # (1) Five high-usage, ball-dominant players -- the existing STAR_STACK_NAMES.
+    "5 ball-dominant guards": STAR_STACK_NAMES,
+    # (2) Five centres, no ball handling. Rebound shares here sum far past 1.0,
+    # which is what the *_PCT clip (CLIPPABLE_PCT_COLS) exists for.
+    "5 centres, no ball handling": [
+        "Rudy Gobert", "DeAndre Jordan", "Andre Drummond", "Clint Capela", "Dwight Howard",
+    ],
+    # (3) Five low-usage players. The regime nothing else here exercises: their
+    # summed volume falls *short* of a real possession count, so usage_scale
+    # comes out ABOVE 1.0 and the aggregation scales volume up rather than down.
+    # Everything measured about conservation so far has been the scale-down side.
+    "5 low-usage role players": [
+        "Andre Roberson", "Tony Allen", "Bruce Bowen", "Thabo Sefolosha", "Royce O'Neale",
+    ],
+    # (4) Five short, rebounding-deficient elite shooters (69-76 inches, career
+    # DREB_PCT 0.06-0.10). Tests the opposite corner from the centres.
+    "5 short off-ball shooters": [
+        "JJ Redick", "Seth Curry", "Isaiah Thomas", "Nate Robinson", "Fred VanVleet",
+    ],
+}
+
+# STATED BEFORE RUNNING, so this is a test and not an observation.
+#
+# Expected: balanced five >~ 5 centres > 5 ball-dominant guards > 5 shooters.
+# The reasoning: a balanced five is the shape the model was fit on and should
+# score best; five centres keep elite rebounding and rim protection and lose
+# only shot creation; five ball-dominant guards lose the ball to conservation
+# (usage_scale ~0.55) and rebound poorly; five short shooters lose the same
+# volume *and* have no defence or rebounding left.
+#
+# "5 low-usage role players" is deliberately absent: it exists to exercise
+# usage_scale > 1.0, and there is no defensible prior for where it should land
+# among the others. A realised ordering that differs from this is a FINDING to
+# record, not a number to tune the feature set toward.
+EXPECTED_STRESS_ORDER = [
+    "balanced five",
+    "5 centres, no ball handling",
+    "5 ball-dominant guards",
+    "5 short off-ball shooters",
+]
+
+
+def prime_roster(pool_elig: pd.DataFrame, names: list[str]) -> pd.DataFrame:
+    """The highest-PIE eligible season for each named player, as a roster.
+
+    Raises on a name that isn't in the pool or has no eligible season, rather
+    than quietly returning a four-man roster -- a stress test that silently
+    dropped a player would still print a plausible record.
+    """
+    ids = pool_elig[["PLAYER_ID", "PLAYER_NAME"]].drop_duplicates()
+    rows = []
+    for name in names:
+        match = ids[ids["PLAYER_NAME"] == name]
+        if match.empty:
+            raise ValueError(
+                f"stress-roster player {name!r} has no eligible season in "
+                f"{PLAYER_SEASONS_CSV} (GP >= {MIN_GP}, MIN >= {MIN_MPG})"
+            )
+        rows.append(prime_season_row(pool_elig, match.iloc[0]["PLAYER_ID"]))
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def run_stress_tests(
+    pool_elig: pd.DataFrame,
+    model,
+    guard: dict,
+    logit_sd: float,
+    feature_cols: list[str] | None = None,
+    ratio_hint: str = "",
+) -> pd.DataFrame:
+    """Score every STRESS_ROSTERS entry and check the realised ordering.
+
+    Per roster: usage_scale, the predicted record with its interval, the
+    extrapolation ratio, whether the *_PCT clip fired, and the three features
+    contributing most to the predicted log-odds. That last part is the reason
+    this is worth printing at all -- an 82-0 with no attribution is a number to
+    argue about, an 82-0 whose three largest terms are DREB_PCT, BLK and PACE
+    is a specific claim that can be checked.
+    """
+    feature_cols = feature_cols or list(model.feature_names_in_)
+    print("\n" + "=" * 78)
+    print("=== Stress rosters (prime seasons from player_all_seasons.csv) ===")
+    print("Expected ordering, stated before running:")
+    print("  " + " > ".join(EXPECTED_STRESS_ORDER))
+    print("  ('5 low-usage role players' is excluded -- it exercises usage_scale > 1.0,")
+    print("   and there is no defensible prior for where it should land.)")
+
+    results = {}
+    for label, names in STRESS_ROSTERS.items():
+        roster = prime_roster(pool_elig, names)
+        line = aggregate_team(roster, feature_cols)
+        pred = float(model.predict(line.to_frame().T)[0])
+        ratio = extrapolation_ratio(guard, line)
+        contrib = logodds_contributions(model, line)
+        top = contrib.reindex(contrib.abs().sort_values(ascending=False).index).head(3)
+
+        print(f"\n--- {label} ---")
+        print("  " + ", ".join(f"{r.PLAYER_NAME} ({r.SEASON})" for r in roster.itertuples()))
+        print(f"  usage_scale: {line.attrs['usage_scale']:.3f}"
+              f"{'  (scaling volume UP)' if line.attrs['usage_scale'] > 1 else ''}")
+        clipped = line.attrs.get("pct_clipped", {})
+        if clipped:
+            print("  *_PCT clipped to 1.0: "
+                  + ", ".join(f"{c} was {v:.3f}" for c, v in clipped.items()))
+        print(f"  extrapolation ratio: {ratio:.1f}x{ratio_hint}")
+        print(f"  largest log-odds contributions (z_score * coef):")
+        for feat, val in top.items():
+            print(f"    {feat:<11s} {val:+7.3f}   (value {line[feat]:.3f})")
+        print("  " + interval_report(pred, logit_sd, guard_ratio=ratio).replace("\n", "\n  "))
+
+        results[label] = {
+            "usage_scale": line.attrs["usage_scale"],
+            "pred_W_PCT": pred,
+            "wins": round(pred * GAMES_PER_SEASON),
+            "ratio": ratio,
+            "clipped": bool(clipped),
+        }
+
+    table = pd.DataFrame(results).T
+    realised = [r for r in table.sort_values("pred_W_PCT", ascending=False).index
+                if r in EXPECTED_STRESS_ORDER]
+    print(f"\nExpected ordering: {' > '.join(EXPECTED_STRESS_ORDER)}")
+    print(f"Realised ordering: {' > '.join(realised)}")
+    if realised == EXPECTED_STRESS_ORDER:
+        print("  -> matches.")
+    else:
+        moved = [r for r in EXPECTED_STRESS_ORDER
+                 if EXPECTED_STRESS_ORDER.index(r) != realised.index(r)]
+        print(f"  -> DIFFERS. Out of place: {', '.join(moved)}. This is a finding about "
+              f"the model,\n     recorded in README Limitations -- not a target to tune "
+              f"the feature set toward.")
+    return table
 
 
 def record(wpct: float, games: int = GAMES_PER_SEASON) -> str:
@@ -537,6 +881,30 @@ def main() -> None:
     model = build_model()
     model.fit(train_df[feature_cols], train_df[TEAM_TARGET])
 
+    # --- Coefficient signs, printed and not asserted ----------------------
+    # This is the model that scores rosters, and 8 of its 16 priced features
+    # carry a sign that contradicts basketball. On real teams that costs
+    # nothing -- the offsetting pairs cancel because the features move together
+    # in every row the model was fit on. A roster is where they stop moving
+    # together, so the caveat belongs next to every roster prediction rather
+    # than in a comment. (A feature set built to fix this was tested and
+    # rejected on accuracy; see README's Test log.)
+    signs = coefficient_signs(model, feature_cols)
+    n_wrong = int((signs["agrees"] == False).sum())  # noqa: E712
+    n_priced = int(signs["agrees"].notna().sum())
+    print("\n=== Coefficients, log-odds per 1 SD, expected sign annotated ===")
+    with pd.option_context("display.float_format", lambda v: f"{v:+.4f}"):
+        print(signs.to_string())
+    print(f"  {n_wrong} of {n_priced} features with a defensible expected sign fit "
+          f"backwards. Printed,\n  never asserted -- see EXPECTED_SIGNS and README "
+          f"Limitations.")
+
+    # The interval attached to every roster prediction below needs an honest
+    # error estimate for the model doing the predicting, measured where it was
+    # not fit -- see train_model.holdout_logit_residual_sd.
+    logit_sd = holdout_logit_residual_sd(teams_all, feature_cols)
+    print(f"\nHeld-out residual SD (log-odds): {logit_sd:.3f}")
+
     # ids/R (every qualifying team's real line) are needed by perturbation_impact()
     # below and reused later for the full team-by-team prediction table.
     ids = list(agg_lines.keys())
@@ -627,7 +995,35 @@ def main() -> None:
     # --- "has the league ever looked like this", for which every observation ---
     # --- counts, not "is this row out of sample". ---
     guard = fit_extrapolation_guard(teams_all[feature_cols], teams_all[TEAM_TARGET])
-    demo_star_stack(qualified, feature_cols, model, guard)
+    # Reference points for reading a stress roster's ratio below: a real team's
+    # own rotation, aggregated by this same code, is the closest thing to a
+    # "normal" roster there is -- and it already lands outside the cloud.
+    top5 = {
+        tid: aggregate_team(grp.sort_values("MIN", ascending=False).head(5), feature_cols)
+        for tid, grp in qualified.groupby("TEAM_ID")
+        if tid in teams.index and len(grp) >= 5
+    }
+    r15 = np.array([extrapolation_ratio(guard, a) for a in agg_lines.values()])
+    r5 = np.array([extrapolation_ratio(guard, a) for a in top5.values()])
+    print(f"\n=== Extrapolation-ratio scale ({len(feature_cols)} features) ===")
+    print(f"  real teams' own 15-man rotations, aggregated: median {np.median(r15):.1f}x  "
+          f"max {r15.max():.1f}x  ({100 * (r15 > 1).mean():.0f}% past the limit)")
+    print(f"  real teams' own top-5 rotations, aggregated : median {np.median(r5):.1f}x  "
+          f"max {r5.max():.1f}x  ({100 * (r5 > 1).mean():.0f}% past the limit)")
+    print("  These are the reference points for reading a stress roster's ratio below.")
+
+    demo_star_stack(qualified, feature_cols, model, guard, logit_sd)
+
+    # --- Four roster shapes the aggregation should handle differently, all
+    # --- built from prime seasons rather than this season's lines. The ratio
+    # --- hint carries the medians measured just above, so a stress roster's
+    # --- ratio is read against real rosters run through the same code. ---
+    pool = load_player_pool()
+    run_stress_tests(
+        pool[eligible_mask(pool)], model, guard, logit_sd,
+        ratio_hint=f"  (real 15-man rotation ~{np.median(r15):.1f}x, "
+                   f"real top-5 ~{np.median(r5):.1f}x)",
+    )
 
 
 if __name__ == "__main__":

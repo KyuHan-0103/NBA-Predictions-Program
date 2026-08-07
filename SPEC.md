@@ -33,13 +33,16 @@ The pipeline runs in four stages:
    NBA Stats API (`nba_api`): team stats per season, and player stats per season
    back to 1996-97 (the first season Advanced player data exists).
 2. **Real-team model (`train_model.py`).** A ridge regression predicts team
-   `W_PCT` from team features, evaluated on a chronological holdout. This is the
-   scoring model the fictional path also reuses. It fits the **logit** of
-   `W_PCT` (`ln(p/(1-p))`, inverted with `1/(1+e^-z)`) so a predicted win rate is
-   bounded in `(0, 1)` for any roster, however extreme — the untransformed model
-   returned win rates above 1 and below 0 on stacked rosters. Callers still hand
-   in and read plain `W_PCT`. Ships an **extrapolation guard** alongside, because
-   a bounded prediction no longer reveals when it is unsupported.
+   `W_PCT` from all 27 team features, evaluated on a chronological holdout. This
+   is the scoring model the fictional path also reuses — a smaller feature set
+   for that path was tested and rejected (README Test log). It fits the
+   **logit** of `W_PCT` (`ln(p/(1-p))`, inverted with `1/(1+e^-z)`) so a
+   predicted win rate is bounded in `(0, 1)` for any roster, however extreme —
+   the untransformed model returned win rates above 1 and below 0 on stacked
+   rosters. Callers still hand in and read plain `W_PCT`. Ships an
+   **extrapolation guard** alongside, because a bounded prediction no longer
+   reveals when it is unsupported, and the **prediction interval** every
+   predicted record is reported with.
 3. **Aggregation (`aggregate_team.py`).** Convert 5–15 players into one
    team-shaped stat-line that the ridge model can score. Includes possession
    conservation; drops DEF_RATING. Self-validates against real teams.
@@ -65,7 +68,11 @@ families are handled by how they actually combine:
   team CSV's exact column definition.
 - **Opponent-dependent rates** (OREB_PCT, DREB_PCT): approximated from the
   players' own rebound shares — the softest estimates in the pipeline, flagged as
-  low-confidence in the output.
+  low-confidence in the output, and **clipped** into `[0, 1]` (five bigs claim
+  ~148% of the opponent's misses otherwise) with every clip recorded in the
+  output's `attrs`. Any other `*_PCT` leaving `[0, 1]` raises instead of being
+  clipped: it is recomputed from the roster's own totals, so out of range means
+  a bug, not an approximation.
 - **DEF_RATING:** dropped. It is opponent-dependent and has no honest analogue for
   a team that never played (see README Test log for the alternatives tested).
 
@@ -103,10 +110,14 @@ accepting picks at 15.
 ## Modeling scope — built vs. tested-and-excluded
 
 - **Built & integrated:** the real-team ridge model; the logit target and its
-  extrapolation guard; player-to-team aggregation; possession conservation.
+  extrapolation guard; player-to-team aggregation; possession conservation; the
+  `*_PCT` clip and its postcondition check; the 90% prediction interval; the
+  stress rosters and the printed expected-vs-fitted coefficient signs.
 - **Tested & deliberately excluded:** every DEF_RATING synthesis approach
-  (sub-model, personal composite, awards composite) and the gradient-boosting
-  model — all dropped with evidence (see README Test log).
+  (sub-model, personal composite, awards composite), the gradient-boosting
+  model, and a reduced rates-and-defence feature set for the fictional path
+  (fixed the coefficient signs, cost 7.7 → 12.9 wins MAE on aggregated rosters)
+  — all dropped with evidence (see README Test log).
 - **Built but NOT integrated:** the usage→efficiency (USG%→TS%) response model.
   Real but weak signal (off-ball only, R² ≈ 0.08; on-ball null), too unreliable to
   wire into predictions. Retained as a standalone experiment in
@@ -139,6 +150,10 @@ accepting picks at 15.
 - Fictional predictions have **no ground truth** and can only be graded indirectly,
   by validating the aggregation on real teams.
 - A predicted record is always **possible** (the logit target bounds it) but that
-  is not evidence it is **supported**. Every aggregated roster lands outside the
-  region of feature space the model was fit on, so a fictional prediction must be
-  read together with the extrapolation guard's ratio — see README Limitations.
+  is not evidence it is **supported**. Aggregated rosters land outside the region
+  of feature space the model was fit on, so a fictional prediction must be read
+  together with the extrapolation guard's ratio — see README Limitations.
+- A predicted record is reported with a **90% interval** covering model error and
+  82-game outcome randomness, and with the two terms it does *not* cover named:
+  the dropped DEF_RATING (~2.6 wins) and the roster's extrapolation ratio.
+  Neither is quantifiable from available data, so neither is folded in.

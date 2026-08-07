@@ -18,12 +18,13 @@ For each player the user picks either:
     so it's a heuristic, not a ground truth (see README Limitations).
   * A specific season (e.g. "2019-20").
 
-Eligibility ("Prime" candidates, and any specific season picked) reuses
-aggregate_team.py's own filter (GP >= MIN_GP, MIN >= MIN_MPG) -- the
-aggregation contract in CLAUDE.md requires the eligibility filter already be
-applied before a roster reaches aggregate_team(), so it's applied here, at
-input time, not left for aggregate_team to assume. A season is also rejected
-if its Advanced columns aren't finite or are all zero (see _is_usable) --
+Eligibility ("Prime" candidates, and any specific season picked) is
+aggregate_team.eligible_mask (GP >= MIN_GP, MIN >= MIN_MPG) -- the aggregation
+contract requires the eligibility filter already be applied before a roster
+reaches aggregate_team(), so it's applied here, at input time, not left for
+aggregate_team to assume, and it lives next to the aggregation so there is one
+definition of it. A season is also rejected if its Advanced columns aren't
+finite or are all zero (the same mask) --
 defensive, since pull_player_seasons_all.py hasn't found this to actually
 happen at the 1996-97 floor, but the aggregation contract forbids NaN/inf and
 this project has already hit one silent-zero trap (pull_player_history.py's
@@ -32,6 +33,17 @@ pre-2013-14 tracking columns), so a cross-check costs nothing.
 If a player isn't found, didn't play in the given season, or the season isn't
 one this project has data for, the tool reports why and asks for another
 player -- it never silently drops or substitutes.
+
+Scoring
+-------
+The roster is scored on the same 27 features train_model.py fits (DEF_RATING
+excluded). A smaller, rates-only feature set was tested for this path and
+rejected -- it fixed the coefficient signs and cost accuracy on aggregated
+rosters (README Test log) -- so the sign caveat stands: several coefficients
+here are individually backwards and only correct in combination, on a row that
+is by construction outside the cloud where that combination held. The
+prediction is printed with a 90% interval whose two components are reported
+separately, and with an explicit note of what that interval does not cover.
 
 This script only builds a roster and scores it -- it does not modify
 aggregate_team.py's aggregation logic.
@@ -42,7 +54,6 @@ from __future__ import annotations
 import re
 import unicodedata
 
-import numpy as np
 import pandas as pd
 
 from aggregate_team import (
@@ -54,35 +65,23 @@ from aggregate_team import (
     TEAM_DROP_COLS,
     TEAM_TARGET,
     aggregate_team,
+    eligible_mask,
+    load_player_pool,
+    prime_season_row,
     record,
 )
-from train_model import build_model, extrapolation_report, fit_extrapolation_guard
+from train_model import (
+    build_model,
+    extrapolation_ratio,
+    extrapolation_report,
+    fit_extrapolation_guard,
+    holdout_logit_residual_sd,
+    interval_report,
+)
 
-PLAYER_CSV = "player_all_seasons.csv"
 MIN_ROSTER = 5
 MAX_ROSTER = 15
-# Advanced columns checked for the NaN/inf/all-zero aggregation-contract guard.
-_ADV_CHECK_COLS = ["MIN", "POSS", "PACE", "OREB_PCT", "DREB_PCT", "PIE"]
 _SEASON_RE = re.compile(r"^(\d{4})-(\d{2})$")
-
-
-def load_player_pool(csv_path: str = PLAYER_CSV) -> pd.DataFrame:
-    try:
-        return pd.read_csv(csv_path, dtype={"SEASON": str})
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            f"{csv_path} not found -- run `python pull_player_seasons_all.py` first."
-        ) from exc
-
-
-def eligible_mask(pool: pd.DataFrame) -> pd.Series:
-    """GP/MIN thresholds (aggregate_team.filter_players) + the NaN/inf/all-zero
-    guard the aggregation contract requires."""
-    vals = pool[_ADV_CHECK_COLS].to_numpy(dtype=float)
-    finite = np.isfinite(vals).all(axis=1)
-    not_all_zero = (vals != 0).any(axis=1)
-    thresholds = (pool["GP"] >= MIN_GP) & (pool["MIN"] >= MIN_MPG)
-    return thresholds & finite & not_all_zero
 
 
 def normalize_season(season: str) -> str | None:
@@ -117,18 +116,6 @@ def find_player_candidates(pool: pd.DataFrame, query: str) -> pd.DataFrame:
     if len(exact) >= 1:
         return exact
     return names[folded.str.contains(q, regex=False)]
-
-
-def eligible_seasons_for_player(pool_elig: pd.DataFrame, player_id) -> pd.DataFrame:
-    return pool_elig[pool_elig["PLAYER_ID"] == player_id].sort_values("SEASON")
-
-
-def prime_season_row(pool_elig: pd.DataFrame, player_id) -> pd.Series | None:
-    """The eligible season with the highest PIE -- see module docstring."""
-    rows = eligible_seasons_for_player(pool_elig, player_id)
-    if rows.empty:
-        return None
-    return rows.loc[rows["PIE"].idxmax()]
 
 
 def season_row(
@@ -244,10 +231,9 @@ def predict_roster(roster: pd.DataFrame) -> float:
     The model fits logit(W_PCT), so the returned record is always a possible
     one -- before the transform, a stacked roster could and did come back with
     a win rate above 1.0. That guarantee is structural, not evidential, so the
-    prediction is printed alongside train_model.py's extrapolation guard, fit
-    on the same team-seasons: it says whether this roster resembles anything
-    the model was fit on, which is the part a bounded output no longer reveals
-    on its own.
+    prediction is printed with two things a bounded number no longer reveals on
+    its own: the extrapolation guard's ratio, and an interval that names what
+    it does not cover.
     """
     teams_all = pd.read_csv(TEAM_CSV)
     feature_cols = feature_columns(teams_all)
@@ -259,15 +245,25 @@ def predict_roster(roster: pd.DataFrame) -> float:
     pred = float(model.predict(agg.to_frame().T)[0])
 
     guard = fit_extrapolation_guard(teams_all[feature_cols], teams_all[TEAM_TARGET])
+    ratio = extrapolation_ratio(guard, agg)
+    # The model above is fit on every season, so its own residuals are optimism,
+    # not error. The interval's width comes from a chronological-holdout refit.
+    logit_sd = holdout_logit_residual_sd(teams_all, feature_cols)
 
     print("\n=== Fictional roster ===")
     print(roster[["PLAYER_NAME", "SEASON"]].to_string(index=False))
 
     print(f"\nPredicted record over {GAMES_PER_SEASON} games: {record(pred)}  (W_PCT {pred:.3f})")
+    print(interval_report(pred, logit_sd, guard_ratio=ratio))
+    print()
     print(extrapolation_report(guard, agg, pred))
     low_conf = agg.attrs.get("low_confidence_cols", ())
     if low_conf:
         print(f"Low-confidence (approximated, not box-score-derived): {', '.join(low_conf)}")
+    clipped = agg.attrs.get("pct_clipped", {})
+    if clipped:
+        print("Clipped to the [0, 1] contract (the approximation ran past what a team "
+              "can take): " + ", ".join(f"{c} was {v:.3f}" for c, v in clipped.items()))
     print("Note: DEF_RATING is dropped from this prediction -- see README Limitations.")
     return pred
 
