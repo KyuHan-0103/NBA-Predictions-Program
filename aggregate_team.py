@@ -66,7 +66,7 @@ import numpy as np
 import pandas as pd
 from nba_api.stats.endpoints import leaguedashplayerstats
 
-from train_model import build_model
+from train_model import build_model, extrapolation_report, fit_extrapolation_guard
 
 TEAM_CSV = "team_season_stats.csv"
 TEAM_DROP_COLS = ["SEASON", "TEAM_ID", "TEAM_NAME", "GP"]
@@ -270,10 +270,20 @@ def build_star_stack(players: pd.DataFrame, names: list[str] = STAR_STACK_NAMES)
     return roster
 
 
-def demo_star_stack(players: pd.DataFrame, feature_cols: list[str], model) -> None:
+def demo_star_stack(
+    players: pd.DataFrame, feature_cols: list[str], model, guard: dict | None = None
+) -> None:
     """Run the star-stack roster through aggregation with conservation on and
     off, and report whether it pulls an unrealistic combined shot/turnover
-    volume down to something a real team could actually play."""
+    volume down to something a real team could actually play.
+
+    This roster is also the model's worst case, and the reason train_model.py
+    fits log-odds: on the untransformed target the conservation-OFF line
+    predicted a win rate above 1.0 (a "200-win season"). The logit makes that
+    impossible, so if `guard` is supplied the extrapolation report is printed
+    with the record -- a saturated 82-0 needs the flag next to it to be read
+    correctly, where an impossible number spoke for itself.
+    """
     roster = build_star_stack(players)
     on = aggregate_team(roster, feature_cols)
     off = aggregate_team(roster, feature_cols, conserve_usage=False)
@@ -290,10 +300,21 @@ def demo_star_stack(players: pd.DataFrame, feature_cols: list[str], model) -> No
     pred_off = float(model.predict(off.to_frame().T)[0])
     print(f"\nPredicted win record  ->  conservation ON: {record(pred_on)}   "
           f"conservation OFF: {record(pred_off)}")
+    print(f"  (raw W_PCT  ON: {pred_on:.3f}   OFF: {pred_off:.3f}  -- both inside (0, 1) "
+          f"by construction now; see train_model.py)")
+
+    if guard is not None:
+        print("\n" + extrapolation_report(guard, on, pred_on))
 
 
 def record(wpct: float, games: int = GAMES_PER_SEASON) -> str:
-    """Express a win percentage as a W-L record over `games`."""
+    """Express a win percentage as a W-L record over `games`.
+
+    The [0, 1] clamp is dead weight for anything the model produces now that it
+    fits logit(W_PCT) -- inv_logit can't leave the interval. It stays because
+    this is also called on hand-supplied and CSV-read win rates, where nothing
+    guarantees that.
+    """
     wins = int(round(min(max(wpct, 0.0), 1.0) * games))
     return f"{wins}-{games - wins}"
 
@@ -601,8 +622,12 @@ def main() -> None:
 
     # --- Star-stack stress test: 5 real, high-usage, ball-dominant players on ---
     # --- a fictional roster together. Expect poss_raw well above poss_target, ---
-    # --- so usage_scale should come out clearly below 1. ---
-    demo_star_stack(qualified, feature_cols, model)
+    # --- so usage_scale should come out clearly below 1. The guard is fit on ---
+    # --- every real team-season (not just the training ones): it's answering ---
+    # --- "has the league ever looked like this", for which every observation ---
+    # --- counts, not "is this row out of sample". ---
+    guard = fit_extrapolation_guard(teams_all[feature_cols], teams_all[TEAM_TARGET])
+    demo_star_stack(qualified, feature_cols, model, guard)
 
 
 if __name__ == "__main__":

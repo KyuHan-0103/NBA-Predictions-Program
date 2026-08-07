@@ -56,7 +56,7 @@ from aggregate_team import (
     aggregate_team,
     record,
 )
-from train_model import build_model
+from train_model import build_model, extrapolation_report, fit_extrapolation_guard
 
 PLAYER_CSV = "player_all_seasons.csv"
 MIN_ROSTER = 5
@@ -239,7 +239,16 @@ def feature_columns(teams_all: pd.DataFrame) -> list[str]:
 def predict_roster(roster: pd.DataFrame) -> float:
     """Aggregate the roster, fit ridge on all available team-seasons (no
     holdout -- there's no real season to validate a fictional team against,
-    so the final model uses every row for the best fit), and predict W_PCT."""
+    so the final model uses every row for the best fit), and predict W_PCT.
+
+    The model fits logit(W_PCT), so the returned record is always a possible
+    one -- before the transform, a stacked roster could and did come back with
+    a win rate above 1.0. That guarantee is structural, not evidential, so the
+    prediction is printed alongside train_model.py's extrapolation guard, fit
+    on the same team-seasons: it says whether this roster resembles anything
+    the model was fit on, which is the part a bounded output no longer reveals
+    on its own.
+    """
     teams_all = pd.read_csv(TEAM_CSV)
     feature_cols = feature_columns(teams_all)
 
@@ -249,10 +258,13 @@ def predict_roster(roster: pd.DataFrame) -> float:
     model.fit(teams_all[feature_cols], teams_all[TEAM_TARGET])
     pred = float(model.predict(agg.to_frame().T)[0])
 
+    guard = fit_extrapolation_guard(teams_all[feature_cols], teams_all[TEAM_TARGET])
+
     print("\n=== Fictional roster ===")
     print(roster[["PLAYER_NAME", "SEASON"]].to_string(index=False))
 
     print(f"\nPredicted record over {GAMES_PER_SEASON} games: {record(pred)}  (W_PCT {pred:.3f})")
+    print(extrapolation_report(guard, agg, pred))
     low_conf = agg.attrs.get("low_confidence_cols", ())
     if low_conf:
         print(f"Low-confidence (approximated, not box-score-derived): {', '.join(low_conf)}")

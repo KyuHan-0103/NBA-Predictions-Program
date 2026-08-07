@@ -55,7 +55,7 @@ isn't re-litigated later.
 | `pull_player_seasons_all.py` | Pulls per-player stats for every season 1996-97 onward (the roster-input pool) → `player_all_seasons.csv`. Data only. |
 | `pull_lineups.py` | Pulls 5-man lineup stats (Base + Advanced), 2014-15 onward → `lineup_season_stats.csv`. Ground truth for `aggregate_team.py`'s 5-man validation. Data only. |
 | `pull_player_defense.py` | Pulls per-player *individual* defensive descriptors — bio (height/weight/age), closest-defender tracking (opponent FG% on shots he defended, 2013-14 onward), hustle (2016-17 onward) → `player_defense_stats.csv`. Data only. |
-| `train_model.py` | Loads the team CSV, splits by season, trains the ridge win-rate model, prints metrics and standardized coefficients (the model's top drivers). |
+| `train_model.py` | Loads the team CSV, splits by season, trains the ridge win-rate model on `logit(W_PCT)`, prints metrics and standardized coefficients (the model's top drivers). Also home to `logit`/`inv_logit`, `ridge_step()` (reaches the `RidgeCV` inside the target-transform wrapper), and the extrapolation guard every roster prediction is reported against. |
 | `aggregate_team.py` | Aggregates 5–15 players into one team stat-line (possession conservation, DEF_RATING dropped), and self-validates by rebuilding every real team from its own roster. |
 | `perturbation_tests.py` | The aggregation's per-feature error-impact diagnostics (`perturbation_impact()` + the deprecated MAPE × coefficient ranking), split out of `aggregate_team.py`. Runs standalone, and `aggregate_team.py` still prints the identical tests via `run_perturbation_tests()`. |
 | `predict_fictional_roster.py` | Interactive roster builder (by player + season); aggregates and scores the roster with the ridge model. |
@@ -100,6 +100,17 @@ comparable across seasons of different length (e.g. the shortened 2019-20 and
 2020-21 seasons), so win *rate* is used and multiplied by 82 to report a
 projected record.
 
+**Target transform — logit, not raw `W_PCT`.** The model fits
+`ln(p / (1-p))` and inverts with `1 / (1 + e^-z)`, so a prediction is in
+`(0, 1)` for any input at all. A win rate is a proportion and cannot leave
+`[0, 1]`; a ridge line does not know that, and the fictional path pushes it far
+enough to matter — on the untransformed target the five-star stress roster
+predicted a win rate of **1.004** with possession conservation on and **−2.609**
+with it off. Callers are unaffected (`build_model()` still takes and returns
+plain `W_PCT`; `TransformedTargetRegressor` applies the transform internally).
+Because a bounded output can no longer announce that it is nonsense, the model
+ships with an extrapolation guard next to it — see Test log.
+
 **Features — per-game and rate stats.** Season-total counting stats (points,
 rebounds, etc.) are divided by games played so a 72-game and an 82-game season
 sit on the same scale. Stats already expressed as rates (shooting percentages,
@@ -134,11 +145,108 @@ postconditions, invariants) lives in `CLAUDE.md`.
   deliberately omits DEF_RATING (see Limitations), which is the single largest
   source of its wider error floor.
 
+> **These two numbers are stale and are not the logit change's doing.**
+> `pull_team_stats.py` now drops `DEF_RATING` from the team pull entirely, so
+> `train_model.py` no longer has it either and the real-team model is down to
+> **MAE ≈ 0.059 → 4.85 wins, test R² 0.813** (the linear-target model scores
+> 4.92 wins / R² 0.806 on the same rows — see the logit Test log entry, which
+> reports both). That is the predicted consequence of removing one of the
+> model's two dominant drivers. Re-measure and rewrite this section once the
+> DEF_RATING decision is settled.
+
+**Coefficient units changed with the target.** The standardized coefficients
+`train_model.py` prints are now **log-odds per 1 SD**, not `W_PCT` per 1 SD.
+There is no single win-equivalent for one of them, because the logistic's slope
+depends on where the prediction sits; the printed `wins_at_500` column converts
+at the steepest point (`dW_PCT/dz = p(1-p) = 0.25` at `p = 0.5`), which is the
+largest swing a coefficient can produce, not a typical one.
+
 ## Test log
 
 The decisions below were made from experiments, not intuition. Each is recorded
 as *what was tested → what the evidence showed → what was decided*, so the
 reasoning survives and isn't rebuilt from scratch.
+
+**Logit target for the win-rate model, plus an extrapolation guard.** `W_PCT` is
+a proportion bounded in `[0, 1]`, and a ridge line fit directly on it has no
+stop at either end. On real teams that never bites — every team-season sits in
+`0.122–0.890`, and predictions stay inside the interval — but the fictional path
+is exactly where it does. *Approach:* fit `logit(p) = ln(p / (1-p))` and invert
+with `1 / (1 + e^-z)`, via `TransformedTargetRegressor`, so `build_model()`'s
+signature is unchanged (callers still pass and read plain `W_PCT`) and the bound
+becomes structural rather than hoped for. `logit()` clips at `1e-6` off each
+pole; the clip never binds on real data (no 0-82 or 82-0 season exists in the
+sample) and is there so the transform is total.
+
+*Evidence — accuracy is a wash, boundedness is not.* Both models fit on
+identical rows, scored on the `W_PCT` scale:
+
+| Rows scored | linear MAE | logit MAE | linear raw range | logit raw range |
+|---|---:|---:|:--|:--|
+| Chronological holdout (60 team-seasons) | 4.92 W | **4.85 W** | in `[0,1]` | in `[0,1]` |
+| Real team lines, current season | 4.9 W | **4.6 W** | `[+0.215, +0.841]` | `[+0.220, +0.814]` |
+| Aggregated rosters, conservation ON | **7.4 W** | 7.5 W | `[+0.082, +0.868]` | `[+0.140, +0.836]` |
+| Aggregated rosters, conservation OFF | 13.1 W | **12.5 W** | `[−0.048, +0.989]` | `[+0.084, +0.895]` |
+
+Test R² 0.806 → 0.813. Across eight one-season-ahead holdouts the two trade
+wins season by season (four each, all within 0.3 wins). This is the expected
+result and not a disappointment: the logistic is near-linear across the
+`0.12–0.89` band real teams occupy, so on real teams the transform has almost
+nothing to do. It earns its place at the extremes — the five-star stress roster
+predicted **1.004** (a "200-win season") under the linear model with
+conservation on and **−2.609** with it off; both are now 0.881 and 0.000. One
+real aggregated team line also came out at −0.048 under the linear model.
+*Decision:* **integrated.** The accuracy case is neutral; the correctness case
+is that the fictional path is the whole point of the program and it is the path
+that produced impossible numbers.
+
+*The cost of the fix, and the guard that pays it.* Bounding the output removes
+the tell. A win rate of 2.44 announces itself as nonsense; a clean-looking 82-0
+does not, and it is what a saturated logistic returns. So `train_model.py` also
+ships `fit_extrapolation_guard()`: Mahalanobis distance from the training teams'
+center on standardized features (Ledoit-Wolf shrunk covariance — PACE and POSS
+correlate at ~0.99, leaving the raw covariance near-singular), with both
+thresholds read off the real teams themselves rather than from a chi-square
+table, since multivariate normality is not something this data has to honor.
+`edge` is the 99th-percentile training distance (5.78), `limit` is the maximum
+(6.36) — the point where extrapolation begins, past which no real team-season
+in the sample speaks to the row. A per-feature bounding box alone would not do:
+the ordinary five-man rotation used to check this breaks exactly one feature's
+range while landing 2.1× out, because what is wrong with it is the
+*combination*, which is what a covariance-aware distance sees and a range check
+does not.
+
+*Calibrating the threshold.* Walking the guard forward one season at a time
+(fit on seasons 1..k, score season k+1; 8 folds, 240 unseen real teams), 4.2% of
+genuinely real teams stepped past the prior seasons' maximum, and the worst ever
+reached **1.13×** it. So a ratio near 1.0 means "a team shape the league hadn't
+produced yet," which happens, and the flag's magnitude — not the flag — is the
+signal.
+
+*Evidence — the flag fires on everything, which is itself the finding.* Measured
+across 180 real team-seasons:
+
+| Row shape | distance | ratio to `limit` | flagged |
+|---|---:|---:|---:|
+| Real team-season the guard never saw | ≤ 7.0 | ≤ 1.13× | 4.2% |
+| Real team's own top-15 rotation, aggregated | median 10.9 | 1.7× (max 2.4×) | **100%** |
+| Real team's own top-5 rotation, aggregated | median 12.0 | 1.9× (max 3.3×) | **100%** |
+| Five-star stress roster, conservation ON | 32.5 | 5.1× | 100% |
+| Cross-era five-star roster | 40.5 | 6.4× | 100% |
+| Five-star stress roster, conservation OFF | 58.4 | 9.2× | 100% |
+
+Every roster that goes through `aggregate_team()` lands outside the real-team
+cloud — including a real team's own starting five, whose actual season really
+happened. The aggregation step displaces a line off that cloud by itself,
+before any fictional-ness enters (rescaling five players to 240 minutes puts
+DREB and PFD past any real team's range, among others). *Decision:* keep the
+threshold defined by the 360 real teams — that genuinely is where the model's
+evidence ends — but report the **ratio** as the headline, with the measured
+scale above printed alongside it, and record that the boolean is a constant on
+the roster path. A flag that always fires is worth nothing; a ratio that
+separates an ordinary rotation (1.9×) from a stacked five (5.1×) by 2.7× is
+worth something. This is not a defect the guard introduced, it is a property of
+the aggregation that nothing had previously measured.
 
 **Ridge vs. gradient boosting (real-team model).** Compared at several dataset
 sizes. Gradient boosting overfit heavily on small data and never overtook ridge:
@@ -478,6 +586,25 @@ is 34%). See Limitations for the resulting bias.
 - **No ground truth for the end goal.** Fictional/cross-era teams never played,
   so their predictions are informed estimates that can't be directly verified.
   The pipeline is graded only *indirectly*, on real teams.
+- **A bounded prediction is not a supported one.** The logit target guarantees
+  every predicted record is *possible*; it guarantees nothing about whether it
+  is *right*. A saturated 82-0 is the logistic running out of room, and it now
+  looks exactly as reasonable as a 48-34. The extrapolation guard exists to
+  restore the distinction the old impossible numbers used to make for free, and
+  it should be read every time — never quote a fictional record without the
+  ratio next to it.
+- **Every aggregated roster is an extrapolation, so the guard's flag is a
+  constant.** 100% of rosters put through `aggregate_team()` land beyond the
+  furthest of 360 real team-seasons — including real teams' own top-5 (median
+  1.9×) and top-15 (median 1.7×) rotations, whose seasons actually happened.
+  The aggregation displaces a line off the real-team cloud on its own, mostly
+  through the rescale to 240 minutes. Only the *ratio* discriminates
+  (ordinary rotation ~1.9× vs. stacked five ~5.1×), and it is a rough,
+  monotone "how strange is this" measure, not a calibrated error bar — nothing
+  maps a ratio to an expected number of wins wrong. Building that mapping (or
+  re-anchoring the guard on aggregated real rosters instead of real team lines,
+  so the flag means "strange for a roster" rather than "strange for a team")
+  is the obvious next step and is not built.
 - **DEF_RATING is dropped on the fictional path.** The part of defense that lives
   in scheme and opponent behavior can't be manufactured from a roster's own
   stats by any method tested (see Test log). This is the largest single component

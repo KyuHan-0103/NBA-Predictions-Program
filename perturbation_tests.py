@@ -41,7 +41,7 @@ from aggregate_team import (
     filter_players,
     load_players,
 )
-from train_model import build_model
+from train_model import build_model, ridge_step
 
 
 def error_impact_deprecated(mape: pd.Series, coefs: pd.Series) -> pd.DataFrame:
@@ -51,11 +51,18 @@ def error_impact_deprecated(mape: pd.Series, coefs: pd.Series) -> pd.DataFrame:
     coefficients (mape_pct * |coef|) as a proxy for prediction-facing error.
     This is unreliable when features are collinear with offsetting
     coefficients: PACE and POSS correlate at ~0.99 here but carry large
-    coefficients of opposite sign (PACE ~-0.29, POSS ~+0.13), so either
+    coefficients of opposite sign (PACE ~-0.97, POSS ~+0.07), so either
     coefficient's magnitude alone overstates how much *that feature's* error
     actually moves a prediction -- some of it is cancelled by the other.
     Kept only so its ranking can be printed alongside perturbation_impact()'s
     for comparison; do not use this to decide which aggregation error matters.
+
+    Second reason not to trust it, added with the logit target: the model now
+    fits log-odds, so `coef` is in log-odds per SD while perturbation_impact()
+    still reports wins. The two columns are no longer even in convertible
+    units -- the logistic's slope depends on where the prediction sits, so
+    there's no single multiplier from one to the other. Compare the rankings,
+    never the magnitudes.
     """
     out = pd.DataFrame({"mape_pct": mape, "coef": coefs, "abs_coef": coefs.abs()})
     out["impact"] = out["mape_pct"] * out["abs_coef"]
@@ -80,6 +87,13 @@ def perturbation_impact(
     teams) of the absolute win-count change -- this is what "the model
     actually cares" should mean, instead of a standardized-coefficient proxy
     that collinearity can make misleading (see error_impact_deprecated()).
+
+    Now that the model fits log-odds, a feature's win impact is no longer the
+    same everywhere: the logistic is steepest at .500 and flattens toward
+    either end, so the identical perturbation moves a 41-win team more than a
+    60-win team. Averaging over all 30 real teams (as below) is what makes the
+    number a league-typical sensitivity rather than one team's; it is not a
+    constant that can be applied to a single extreme roster.
 
     Known limitation: this is a one-at-a-time perturbation, which assumes
     each feature's aggregation error is independent of the others' -- that
@@ -116,11 +130,15 @@ def run_perturbation_tests(
     This is the block that used to sit inline in aggregate_team.main(), moved
     here verbatim so both entry points print the same thing.
     """
-    coefs = pd.Series(model.named_steps["ridgecv"].coef_, index=feature_cols)
+    # ridge_step() rather than model.named_steps: build_model() wraps the
+    # pipeline in a TransformedTargetRegressor for the logit target, so the
+    # estimator is one level deeper now. Units are log-odds per SD (see
+    # error_impact_deprecated).
+    coefs = pd.Series(ridge_step(model).coef_, index=feature_cols)
     impact_old = error_impact_deprecated(mape, coefs)
     impact_new = perturbation_impact(model, real_lines, mape, feature_cols)
 
-    print("\n=== [DEPRECATED] MAPE x ridge coefficient: real error impact (desc) ===")
+    print("\n=== [DEPRECATED] MAPE x ridge coefficient, log-odds units (desc) ===")
     with pd.option_context("display.float_format", lambda v: f"{v:.4f}"):
         print(impact_old.to_string())
 
@@ -139,9 +157,10 @@ def run_perturbation_tests(
     print(disagreements.to_string())
     print(
         "Expect PACE/POSS to disagree most: their ~0.99 correlation and offsetting\n"
-        "coefficients (PACE ~-0.29, POSS ~+0.13) let the deprecated method's\n"
-        "coefficient-magnitude proxy overstate/understate impact that the\n"
-        "perturbation test measures directly."
+        "coefficients (PACE ~-0.97, POSS ~+0.07 in log-odds per SD) let the deprecated\n"
+        "method's coefficient-magnitude proxy overstate/understate impact that the\n"
+        "perturbation test measures directly. Note the two tables are now in different\n"
+        "units too (log-odds per SD vs. wins) -- compare ranks, not magnitudes."
     )
     return impact_old, impact_new
 

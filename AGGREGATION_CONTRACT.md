@@ -20,3 +20,8 @@ Invariants (modeling rules, not just code):
 - OFF_RATING is reconstructable from the team's own box score; DEF_RATING and
   rebound shares are APPROXIMATIONS — label them as low-confidence, don't treat
   them as ground truth.
+- The output feeds a model fitted on logit(W_PCT), so a predicted win rate is
+  always inside (0, 1) — that is a property of the transform, NOT a sign the
+  aggregated line is realistic. Every aggregated roster, real ones included,
+  falls outside the training teams' feature-space region; report the
+  extrapolation guard's ratio with any prediction (train_model.extrapolation_report).

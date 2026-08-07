@@ -31,7 +31,7 @@ KEYS = ["TEAM_ID", "SEASON"]
 # Redundant raw columns to drop from the base stats (W_PCT is intentionally kept).
 BASE_DROP = ["W", "L", "PLUS_MINUS", "FG3_PCT", "FT_PCT", "FG_PCT"]
 # Redundant column to drop from the advanced stats.
-ADVANCED_DROP = ["NET_RATING", "E_PACE", "E_OFF_RATING", "E_NET_RATING", "AST_PCT", "REB_PCT", "PACE_PER40", "TS_PCT", "E_DEF_RATING", "PIE"]
+ADVANCED_DROP = ["NET_RATING", "DEF_RATING", "E_PACE", "E_OFF_RATING", "E_NET_RATING", "AST_PCT", "REB_PCT", "PACE_PER40", "TS_PCT", "E_DEF_RATING", "PIE"]
 
 # Season-total counting stats that must be divided by games played (GP) to become
 # per-game. Everything not listed here (W_PCT, *_PCT, *_RATING, PACE, PACE_PER40,

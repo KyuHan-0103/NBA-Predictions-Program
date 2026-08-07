@@ -34,7 +34,12 @@ The pipeline runs in four stages:
    back to 1996-97 (the first season Advanced player data exists).
 2. **Real-team model (`train_model.py`).** A ridge regression predicts team
    `W_PCT` from team features, evaluated on a chronological holdout. This is the
-   scoring model the fictional path also reuses.
+   scoring model the fictional path also reuses. It fits the **logit** of
+   `W_PCT` (`ln(p/(1-p))`, inverted with `1/(1+e^-z)`) so a predicted win rate is
+   bounded in `(0, 1)` for any roster, however extreme — the untransformed model
+   returned win rates above 1 and below 0 on stacked rosters. Callers still hand
+   in and read plain `W_PCT`. Ships an **extrapolation guard** alongside, because
+   a bounded prediction no longer reveals when it is unsupported.
 3. **Aggregation (`aggregate_team.py`).** Convert 5–15 players into one
    team-shaped stat-line that the ridge model can score. Includes possession
    conservation; drops DEF_RATING. Self-validates against real teams.
@@ -97,8 +102,8 @@ accepting picks at 15.
 
 ## Modeling scope — built vs. tested-and-excluded
 
-- **Built & integrated:** the real-team ridge model; player-to-team aggregation;
-  possession conservation.
+- **Built & integrated:** the real-team ridge model; the logit target and its
+  extrapolation guard; player-to-team aggregation; possession conservation.
 - **Tested & deliberately excluded:** every DEF_RATING synthesis approach
   (sub-model, personal composite, awards composite) and the gradient-boosting
   model — all dropped with evidence (see README Test log).
@@ -133,3 +138,7 @@ accepting picks at 15.
   or era-adjusted best-season judgment.
 - Fictional predictions have **no ground truth** and can only be graded indirectly,
   by validating the aggregation on real teams.
+- A predicted record is always **possible** (the logit target bounds it) but that
+  is not evidence it is **supported**. Every aggregated roster lands outside the
+  region of feature space the model was fit on, so a fictional prediction must be
+  read together with the extrapolation guard's ratio — see README Limitations.
