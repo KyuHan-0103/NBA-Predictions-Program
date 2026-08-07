@@ -29,6 +29,19 @@ A model of how a player's shooting efficiency responds to a change in usage rate
 was built and tested, but found too weak to trust (see Test log). It exists as a
 standalone script and is deliberately **not** wired into the aggregation.
 
+**Built but NOT integrated — the 5-man lineup DEF_RATING model.**
+A fourth attempt at the DEF_RATING problem, under a construction that makes the
+circularity of the earlier three *causally impossible*: a lineup's DEF_RATING is
+predicted from its five players' **prior-season** individual stats only, with all
+on-court team context (player DEF/OFF/NET_RATING, PLUS_MINUS, on/off splits)
+forbidden from every season. Evaluated by rolling-origin CV over six held-out
+seasons, it finds **real but small** signal: season-centered lineup-level
+R² **0.058 [−0.006, +0.122]** against a label-noise ceiling of 0.330, and at
+team level a stable calibration of `DRtg_used = 37.85 + 0.679 × DRtg_est`
+(R² **0.233**, 133 held-out team-seasons) — which still only beats "predict the
+league average" by 4% of team-level MAE. Lives in `lineup_defense_model.py`;
+deliberately **not** wired into the aggregation (see Test log and Limitations).
+
 **Resolved by removal — DEF_RATING and the gradient-boosting model.**
 Both were tested thoroughly and dropped; the reasoning is preserved below so it
 isn't re-litigated later.
@@ -41,10 +54,13 @@ isn't re-litigated later.
 | `pull_player_stats.py` | Pulls current-season per-player Base + Advanced stats → `player_season_stats.csv`. Data only. |
 | `pull_player_seasons_all.py` | Pulls per-player stats for every season 1996-97 onward (the roster-input pool) → `player_all_seasons.csv`. Data only. |
 | `pull_lineups.py` | Pulls 5-man lineup stats (Base + Advanced), 2014-15 onward → `lineup_season_stats.csv`. Ground truth for `aggregate_team.py`'s 5-man validation. Data only. |
+| `pull_player_defense.py` | Pulls per-player *individual* defensive descriptors — bio (height/weight/age), closest-defender tracking (opponent FG% on shots he defended, 2013-14 onward), hustle (2016-17 onward) → `player_defense_stats.csv`. Data only. |
 | `train_model.py` | Loads the team CSV, splits by season, trains the ridge win-rate model, prints metrics and standardized coefficients (the model's top drivers). |
 | `aggregate_team.py` | Aggregates 5–15 players into one team stat-line (possession conservation, DEF_RATING dropped), and self-validates by rebuilding every real team from its own roster. |
+| `perturbation_tests.py` | The aggregation's per-feature error-impact diagnostics (`perturbation_impact()` + the deprecated MAPE × coefficient ranking), split out of `aggregate_team.py`. Runs standalone, and `aggregate_team.py` still prints the identical tests via `run_perturbation_tests()`. |
 | `predict_fictional_roster.py` | Interactive roster builder (by player + season); aggregates and scores the roster with the ridge model. |
 | `usage_efficiency_model.py` | **Standalone, not integrated.** Fits and tests the usage→efficiency (USG%→TS%) response model. Kept as a documented experiment. |
+| `lineup_defense_model.py` | **Standalone, not integrated.** Estimates a 5-man lineup's DEF_RATING from its players' prior-season individual stats (permutation-invariant pooling, possession-weighted, rolling-origin CV by season), with the possession-floor sweep, label-noise ceiling, both baselines, and the reliability / team-change diagnostics. Kept as a documented experiment. |
 | `SPEC.md` | Full project specification. |
 | `CLAUDE.md` | Working agreements, incl. the aggregation contract. |
 
@@ -55,12 +71,15 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-python pull_team_stats.py            # team data     -> team_season_stats.csv
+python pull_team_stats.py            # team data      -> team_season_stats.csv
 python pull_player_seasons_all.py    # player pool    -> player_all_seasons.csv
 python pull_lineups.py               # 5 man lineups  -> lineup_season_stats.csv
+python pull_player_defense.py        # player defense -> player_defense_stats.csv
 python train_model.py                # train + report the real-team model
 python aggregate_team.py             # aggregation + real-team validation
+python perturbation_tests.py         # aggregation error-impact diagnostics only
 python predict_fictional_roster.py   # build a roster and predict its record
+python lineup_defense_model.py       # 5-man lineup DEF_RATING experiment
 ```
 
 ## Configuration
@@ -71,6 +90,8 @@ Knobs live at the top of each script:
 - `N_TEST_SEASONS` — recent seasons held out for testing (`train_model.py`)
 - `ALPHAS` — ridge penalty grid searched by cross-validation
 - `MIN_GP`, `MIN_MPG` — player eligibility thresholds derived from graphs in docs (`aggregate_team.py`)
+- `POSS_FLOORS`, `PRIMARY_POSS_FLOOR` — lineup possession floors compared, and the one chosen from that comparison (`lineup_defense_model.py`)
+- `MIN_TRAIN_SEASONS`, `LINEUP_ALPHAS` — first rolling-origin fold's training depth, and the ridge grid (deliberately wider than `train_model.py`'s — see Test log) (`lineup_defense_model.py`)
 
 ## Methodology
 
@@ -201,6 +222,10 @@ change over all 30 teams. *Evidence:* the two rankings disagree most exactly
 where predicted — PACE and DREB_PCT swap rank by 7-9 places between the two
 methods. *Decision:* **perturbation_impact() is now primary**; the old
 function is kept as `error_impact_deprecated()` so both print side by side.
+Both now live in `perturbation_tests.py` rather than inline in
+`aggregate_team.py` — the tests themselves are unchanged (verified: the full
+`python aggregate_team.py` output is byte-identical before and after the move,
+and the standalone `python perturbation_tests.py` prints the same section).
 Known limitation of the new diagnostic too: it perturbs one feature at a
 time, which assumes independent feature errors — false here, since PACE,
 POSS, FGA, and PTS errors all originate in the same usage-scaling step.
@@ -250,6 +275,204 @@ signal rather than a units artifact. *Decision:* **rescale integrated** into
 `validate_against_lineups()`; see Limitations for what the residual 5-man-vs-
 15-man gap in low-frequency stats means for a fictional prediction.
 
+**5-man lineup DEF_RATING from players' prior-season stats
+(`lineup_defense_model.py`).** The fourth and most careful attempt at the
+DEF_RATING problem. The three earlier ones (sub-model, personal composite,
+awards composite) all either failed or only "worked" by borrowing the real,
+current-season, on-court DEF_RATING of the team being predicted. *Approach:*
+predict a real 5-man lineup's own observed DEF_RATING from its five players'
+**prior-season** individual stats — a 2023-24 lineup described only by its
+players' 2022-23 lines, which makes it causally impossible for a feature to
+contain the target — with **all on-court team context forbidden from every
+season** (player DEF/OFF/NET_RATING, PLUS_MINUS, any on/off split; PIE and
+USG_PCT are also excluded as not cleanly "his own"). Features: own box score
+(BLK, STL, DREB, OREB, PF, PFD, BLKA per 36), own rebound rates, closest-
+defender tracking (opponent FG% and its league-baseline delta), height, weight,
+age, MIN, GP, position counts, and prior-season roster continuity — 32 features,
+27 after pruning. Possession-weighted throughout.
+
+*Feature construction.* Five players are an unordered set, so features are
+pooled, not concatenated by slot. Two things fell out of doing that honestly:
+at a fixed group size of five a **sum is exactly 5× the mean**, so including
+both would make the design matrix exactly singular (mean only is kept); and
+pooling is order-free in exact arithmetic but *not* bit-identical in floating
+point, so each lineup's players are sorted by `PLAYER_ID` before aggregating.
+`test_permutation_invariance()` shuffles all five slots in every row and asserts
+the feature matrix is **byte-identical** — it passes (999 of 1,005 rows actually
+reordered at the primary floor). Order statistics (max/min/std of `BLK_36`,
+`STL_36`, `DREB_PCT`, height) sit on top of the means, since a mean hides "this
+lineup has one elite rim protector."
+
+**Sample-weight scale silently disabled the ridge penalty.** *Found:* RidgeCV
+was selecting α = 1000 — exactly the top of `train_model.py`'s
+`logspace(-3, 3, 25)` grid — and Ridge and OLS agreed to three decimals. Both
+were symptoms of one bug. sklearn's ridge objective is
+`Σ wᵢ(yᵢ − xᵢ·β)² + α‖β‖²`, so weights and penalty share a scale; weights were
+being passed as **raw season-total possessions** (mean ≈ 550 at the primary
+floor), which multiplies the data term by ~550 and therefore divides the
+effective penalty by ~550. α = 1000 was really acting like α ≈ 2 — an
+essentially unregularized fit, which is why "Ridge ≈ OLS" looked like evidence
+of a robust signal and was nothing of the kind. *Fix:* mean-normalize the
+weights (relative weighting, and so every possession-weighted metric, is
+unchanged) and extend the grid to `logspace(-3, 6, 40)`. *Evidence after the
+fix:* α lands at 41–346 across folds and floors — strictly **interior** to the
+grid every time — and ridge now actually shrinks: `‖ridge coef‖ / ‖OLS coef‖`
+= 0.78 → 0.16 as the possession floor rises and rows get scarcer, exactly the
+direction more shrinkage should move. It also changed the ranking: Ridge now
+beats OLS at every floor on the headline metric (season-centered R² 0.058 vs
+0.003 at floor 250), where before they were indistinguishable. *Standing rule:*
+a CV-selected hyperparameter pinned to a grid endpoint is a bug report, not a
+result.
+
+**Rolling-origin CV replaced the single 2-season holdout.** *Why:* the old
+evaluation trained on 10 of 12 seasons and reported one number from ~160
+lineups. With correlated rows (see Limitations) that is one season's weather,
+not a measurement — and several conclusions drawn from it did not survive.
+*Approach:* expanding chronological window, never shuffled — fold 1 trains
+2014-15..2019-20 and tests 2020-21, fold 2 adds 2020-21 to training and tests
+2021-22, out to 2025-26; six held-out seasons, ~340–3,200 out-of-fold lineups
+depending on floor. 95% CIs are computed **across folds** (t, df = 5), not by
+bootstrapping rows: lineups inside a team-season share four of five players, so
+a row bootstrap would be anti-conservative.
+
+*Headline metric is the season-centered target.* League-average team DEF_RATING
+rose **104.7 → 114.7** across the sample, so a raw-target R² is largely being
+charged for a league-wide scoring-environment shift that has nothing to do with
+which five players are on the floor (the constant baseline's raw-target bias is
+−2.5 to −4.8 points depending on floor). Centering on the season's league
+average and scoring back in raw points isolates the lineup question; using it in
+production requires forecasting next season's league average separately, which
+is a one-number league-level problem the raw model tries to do implicitly and
+badly.
+
+*Possession floor, re-picked under the CV folds* (Ridge, season-centered, best
+model at every floor):
+
+| POSS floor | lineups (OOF) | R² ceiling | R² mean [95% CI] | share of ceiling | MAE gain vs const | team slope | team R² | team-seasons | team MAE (cal.) vs league avg |
+|---:|---:|---:|:--|---:|---:|---:|---:|---:|:--|
+| 50  | 6,446 (3,177) | 0.167 | **+0.026 [+0.016, +0.037]** | 0.158 | 0.179 | 0.716 | 0.218 | 179 | 2.24 vs 2.23 (worse) |
+| 100 | 2,621 (1,227) | 0.227 | +0.035 [−0.003, +0.073] | 0.153 | 0.169 | 0.712 | 0.224 | 166 | 2.17 vs 2.19 |
+| 200 | 1,047 (477)   | 0.285 | +0.058 [−0.005, +0.120] | **0.202** | 0.200 | 0.708 | 0.234 | 142 | 2.05 vs 2.11 |
+| 250 |   757 (335)   | 0.330 | +0.058 [−0.006, +0.122] | 0.176 | **0.202** | 0.705 | **0.240** | 133 | **1.96 vs 2.07** |
+
+*Evidence:* the trade is not "more data is better." At 50 possessions ~83% of
+the label's variance is sampling noise, and that floor's team-level estimate is
+**no better than predicting the league average** (2.24 vs 2.23) — its extra
+rows are mostly noise rows. Higher floors win on lineup-level R², on share of
+the achievable ceiling, and on the team-level numbers the estimate would
+actually be used through. *Decision:* `PRIMARY_POSS_FLOOR = 250`, chosen on the
+team-level column; floor 200 is statistically indistinguishable with 42% more
+held-out lineups and is the conservative alternative. Two caveats kept in view:
+above floor 50 the lineup-level CI **includes zero** (only floor 50's small
+effect is separable from zero across folds), and a high floor leaves fewer
+team-seasons with any qualifying lineup (133 of 180 vs 179), so its calibration
+is fit on a self-selected set of stable rotations.
+
+*Model comparison* (floor 250, six folds, identical features/weights,
+season-centered target, MAE in DEF_RATING points):
+
+| Model | R² mean [95% CI] | worst fold | best fold | MAE | pooled-OOF R² |
+|-------|:--|---:|---:|---:|---:|
+| **Ridge** (α 70–346, interior) | **+0.058 [−0.006, +0.122]** | −0.027 | +0.141 | **4.52** | **+0.096** |
+| OLS | +0.003 [−0.111, +0.117] | −0.131 | +0.153 | 4.66 | +0.048 |
+| Gradient boosting (defaults) | −0.066 [−0.152, +0.020] | −0.165 | +0.063 | 4.82 | −0.026 |
+| Baseline: constant (league avg) | −0.009 | −0.036 | −0.000 | 4.73 | +0.025 |
+| Baseline: BLK+STL+DREB sum | −0.005 | −0.034 | +0.020 | 4.75 | +0.028 |
+
+*Evidence:* ridge is the model — the honest ordering only became visible after
+the weight fix. The naive blocks+steals+rebounds sum is worth **nothing** over a
+constant, a useful negative result about the raw defensive box score. Gradient
+boosting is negative on 4 of 6 folds; it had a real chance here (~10× the team
+model's rows, and rim protection is where threshold effects would live), was fit
+at sklearn defaults with no tuning, and lost anyway — the same way it lost for
+the team model.
+
+*Roster continuity: a null, and a retraction.* The single-holdout run had shown
+continuity lineups defending ~1.5 points better than their players' prior stats
+predict and reshuffled ones ~1.1 points worse (a 2.7-point bias spread), which
+looked like a real chemistry effect worth modeling. *Approach:*
+`CONTINUITY_PAIR_FRAC` — of the 10 pairs among five players, the fraction who
+ended the prior season on the same team. Prior-season membership only: no
+minutes-together, no current-season performance, nothing dated after the roster
+is known, so it is computable before a season starts and for a roster that has
+never played (a cross-era fictional five scores 0.0). *Evidence:* the feature is
+a **null** — ridge coefficient −0.073 DEF_RATING points per SD, season-centered
+R² 0.058 with it vs 0.057 without. And the effect it was built for largely
+**was not there**: under rolling-origin CV the group bias spread is 0.99 points,
+not 2.7, and the MAE gap *reverses sign* — mover lineups are predicted **better**
+(MAE 4.35 vs 4.72, R² 0.122 vs 0.050), not worse. Adding continuity narrows the
+bias spread 0.99 → 0.89; a per-group intercept (a diagnostic refit that uses
+current-season team identity and is deliberately not a model feature) gets it to
+0.79 and moves the MAE gap by 0.001, so what remains is a small level effect
+with **no sign of context memorization** — a model leaning on "this team defends
+well" would have been much more accurate on the continuity group, and is the
+opposite. *Decision:* kept (it costs nothing and is the right shape for the
+question), but recorded as a null rather than the fix it was meant to be, and
+the earlier 2.7-point continuity claim is **withdrawn as single-holdout noise**.
+
+*Per-feature sensitivity, then pruning.* `perturbation_impact()` here is the
+same diagnostic as `perturbation_tests.py`'s, with each feature moved ±1 SD
+instead of by an aggregation MAPE (there is no aggregation step to measure) and
+the output in DEF_RATING points rather than wins. Top of the ranking:
+`BLKA_36_mean` (0.44 pts/SD), `PCT_PLUSMINUS_mean` (0.35), `BLK_36_min` (0.32),
+`BLK_36_max` (0.27), `BLK_36_mean` (0.27), `STL_36_mean` (0.25) — shot-blocking
+and closest-defender columns, which is the right shape for a defensive model;
+bottom: `DREB_PCT_max`, `MIN_mean`, height min/std, `DREB_36_mean`. Pruning the
+three collinear blocks the coefficient table exposed (the offsetting
+`OREB_36_mean` / `OREB_PCT_mean` pair; `PCT_PLUSMINUS_mean`, mechanically
+`D_FG_PCT − NORMAL_FG_PCT`; the `DREB_PCT` std/max/min triple collapsed to
+`DREB_PCT_max`) took 32 features to 27 with Ridge season-centered R² 0.058 →
+0.051 → 0.048 → 0.051. *Evidence:* pruning is a **wash to slightly negative** —
+every step is far inside the ±0.06 CI, and ridge was already handling the
+collinearity (that is what the L2 penalty is for). *Decision:* keep the pruned
+27-feature set on parsimony grounds, with the ~0.007 R² cost recorded rather
+than presented as an improvement.
+
+*Reliability / calibration (required for integration).* Out-of-fold predictions
+from all six held-out seasons, rolled up to team level (possession-weighted),
+regressed as true team DEF_RATING on the estimate, 133 held-out team-seasons:
+
+| Model / target | slope | intercept | R² | sd(est) | sd(true) | team MAE raw → calibrated | league-avg baseline |
+|---|---:|---:|---:|---:|---:|:--|---:|
+| **Ridge, season-centered** | **0.679** | **37.85** | **0.233** | 2.00 | 2.82 | 2.93 → **1.98** | 2.07 |
+| OLS, season-centered | 0.483 | 59.40 | 0.202 | 2.62 | 2.82 | 3.10 → 2.01 | 2.07 |
+| Ridge, raw target | 0.493 | 59.62 | 0.173 | 2.37 | 2.82 | 5.28 → 2.06 | 2.07 |
+| OLS, raw target | 0.389 | 70.61 | 0.151 | 2.81 | 2.82 | 4.79 → 2.09 | 2.07 |
+
+`DRtg_used = 37.85 + 0.679 × DRtg_estimated` is the number a margin-based win
+model would have to apply. *Evidence:* the shrinkage is much less severe than
+the 0.394 the buggy-ridge single-holdout run reported, and the slope is
+remarkably stable across possession floors (0.705–0.716 for the unpruned fit at
+every floor), which is what a real coefficient looks like. R² 0.233 of
+between-team defensive variance, out of sample, from player stats that predate
+the season and contain no team context, is a genuine result — for scale, the
+DEF_RATING sub-model rejected earlier in this log managed R² ≈ 0.19 using the
+*current* season's box score. *But* R² 0.233 only cuts the residual SD by ~12%,
+so at team level the calibrated estimate beats "just predict the league average"
+by 1.98 vs 2.07 points of MAE — about 4%. *Decision:* still **not integrated.**
+The estimate is real, is now honestly calibrated, and is not yet worth a
+feature: 4% of team-level MAE cannot carry the weight of replacing a dropped
+column that the win model treats as one of its two dominant drivers. The
+slope/intercept above are what a future integration must apply.
+
+*Hustle stats: null under CV.* Contested shots, deflections, defensive box-outs,
+charges drawn and loose balls exist only from 2016-17 (2015-16 returns a
+147-player, median-1-game partial season that looks like real data — see
+`pull_player_defense.py`), so using them costs the three oldest lineup seasons.
+On the identical reduced sample and identical folds: Ridge season-centered R²
+**0.030 [−0.224, +0.285] with** hustle vs **0.039 [−0.224, +0.303] without**,
+MAE 4.60 vs 4.58. *Decision:* **off by default**, kept behind `use_hustle` with
+the comparison printed every run. (The single-holdout run had made hustle look
+like a 0.23-point MAE gain on the raw target; under CV on the centered target it
+is nothing — another number that did not survive the better evaluation.)
+
+*Rookies.* A lineup is dropped if any of its five players lacks a usable prior
+season, rather than imputed — imputing a league-average defender would inject a
+fabricated feature vector under a real label. This is the single largest sample
+cut: at floor 250, 230 of 1,005 lineups (23%) are dropped for a missing prior
+season and 18 more for a prior season below `MIN_GP`/`MIN_MPG` (at floor 50 it
+is 34%). See Limitations for the resulting bias.
+
 ## Limitations & next steps
 
 - **No ground truth for the end goal.** Fictional/cross-era teams never played,
@@ -258,7 +481,85 @@ signal rather than a units artifact. *Decision:* **rescale integrated** into
 - **DEF_RATING is dropped on the fictional path.** The part of defense that lives
   in scheme and opponent behavior can't be manufactured from a roster's own
   stats by any method tested (see Test log). This is the largest single component
-  of the ~7.6-win aggregated error floor.
+  of the ~7.6-win aggregated error floor. The prior-season lineup model
+  (`lineup_defense_model.py`) is the closest thing to a non-circular estimate the
+  project has, and it is still not good enough to wire in — see the four
+  limitations immediately below.
+- **Lineups are not randomly assigned — the target is selection-biased.** Coaches
+  choose which five players play together, and when. Good lineups get more
+  minutes, start halves, face opposing starters, and appear in different game
+  states (score margin, clock, opponent personnel) than bench units do; a
+  closing lineup's DEF_RATING partly reflects that it was on the floor in
+  close, slow, half-court games. So a lineup's observed DEF_RATING is not a
+  clean measurement of "how well these five defend" — it is that, plus the
+  context its coach put it in. Possession-weighting and a large sample dilute
+  this (each team's most-used units carry the most weight, and coaching
+  tendencies differ across 30 teams and 12 seasons) but do **not** remove it:
+  the bias is correlated with lineup quality, which is exactly the thing being
+  predicted. Nothing in the current model corrects for it; an
+  opponent-and-game-state adjustment would be the honest fix.
+- **Every R² here has to be read against the label-noise ceiling, not against
+  1.0.** A lineup's DEF_RATING is a sample mean over its possessions, so most of
+  its observed spread is sampling noise in the *label*, not signal a model could
+  ever recover. Decomposing that (`label_noise_decomposition()`: fit
+  `Var_observed = Var_true + k·mean(1/POSS)` across possession bins,
+  season-centered) puts the achievable ceiling at **0.167 at a 50-possession
+  floor, 0.227 at 100, 0.285 at 200, 0.330 at 250** — i.e. even a model that knew
+  each lineup's true defensive quality exactly would score R² ≈ 0.33 at the floor
+  used here. The model's 0.058 is therefore ~18% of what is available, not ~6% of
+  a perfect prediction. Quoting a lineup-level R² without the ceiling next to it
+  makes an ordinary result look like a failure and a noise-floor artifact look
+  like signal.
+- **The season-centered result at the chosen floor is R² 0.058 [−0.006, +0.122],
+  and the CI includes zero.** Six rolling-origin folds, Ridge, floor 250: positive
+  on 5 of 6 held-out seasons (worst −0.027, best +0.141), MAE 4.52 vs the
+  league-average baseline's 4.73. The interval is wide because the honest unit of
+  replication is a *season*, not a lineup (see non-independence below), and six
+  seasons is six data points. Only the 50-possession floor produces an interval
+  that excludes zero (+0.016 to +0.037) — and that floor's team-level estimate is
+  no better than predicting the league average. Read the lineup-level effect as
+  "small, probably real, not yet separable from zero at this sample size."
+- **The reliability slope is 0.68 — about a third of the estimate's spread has to
+  be shrunk away.** Out-of-fold across all six held-out seasons, rolled up to
+  team level (possession-weighted), true team DEF_RATING on the estimate:
+  `DRtg_used = 37.85 + 0.679 × DRtg_est`, R² **0.233**, 133 team-seasons,
+  sd(estimate) 2.00 vs sd(true) 2.82. Any future integration must apply that
+  slope and intercept, not the raw estimate. In MAE terms the calibrated team
+  estimate is **1.98 vs 2.07** for "just predict the league average" — a 4%
+  improvement, because R² 0.233 only cuts residual SD by ~12%. That combination
+  (a real, stable slope; a barely-better MAE) is the whole reason the model is
+  documented and *not* wired in. The earlier 0.394 slope / R² 0.112 in this
+  README came from the buggy-ridge single-holdout run and is superseded.
+- **The team-change gap does not reproduce.** On a single 2-season holdout the
+  model looked 0.79 MAE points worse on lineups containing a player who changed
+  teams, with a 2.7-point opposite-signed bias split — which read as a real
+  continuity effect. Under six rolling-origin folds (335 held-out lineups instead
+  of 159) the sign **reverses**: mover lineups are predicted *better* (MAE 4.35 vs
+  4.72, R² 0.122 vs 0.050) and the bias spread is 0.99 points, not 2.7. A
+  per-group intercept moves the MAE gap by 0.001, so there is no evidence of the
+  model memorizing team context — but also no measured continuity penalty to
+  apply to a fictional roster. What remains is a genuine caution of a different
+  kind: `CONTINUITY_PAIR_FRAC` = 0 (five players who never shared a team, i.e.
+  every cross-era roster) describes **0.4%** of the training sample, so the model
+  is extrapolating there regardless of how small its continuity coefficient is.
+- **Rookie exclusion biases the sample toward veteran lineups.** A lineup is
+  dropped whenever any of its five players has no usable prior season, which
+  removes 23% of lineups at the primary possession floor (34% at floor 50).
+  Dropping rather than imputing keeps fabricated feature vectors out of the fit,
+  but the surviving sample systematically over-represents established rotations
+  and under-represents young, high-turnover lineups — so the model has been
+  fit and graded on veteran units, and its accuracy on a lineup built around
+  first- or second-year players is unmeasured, not merely worse. The same cut
+  removes team-seasons entirely at high floors: the calibration above is fit on
+  133 of 180 possible team-seasons, self-selected toward stable rotations.
+- **Lineup rows are far from independent.** Within one team-season, dozens of
+  lineups share four of their five players, and a player's prior-season line is
+  reused by every lineup he appears in. Row counts therefore overstate the
+  effective sample size considerably. Three consequences, all live: CIs are
+  computed across season folds rather than by bootstrapping rows (a row
+  bootstrap would be anti-conservative); the evaluation is chronological and
+  never random; and the gradient-boosted fit's train R² should be read as
+  memorization rather than signal.
 - **"Prime" is a heuristic.** The roster tool's "Prime" season is the eligible
   season with the highest PIE — a box-score summary that is **not** era- or
   pace-adjusted. It's a reasonable no-extra-computation stand-in, not a

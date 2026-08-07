@@ -106,6 +106,16 @@ accepting picks at 15.
   Real but weak signal (off-ball only, R² ≈ 0.08; on-ball null), too unreliable to
   wire into predictions. Retained as a standalone experiment in
   `player_efficiency.py`.
+- **Built but NOT integrated:** the 5-man lineup DEF_RATING model
+  (`lineup_defense_model.py`) — predicts a lineup's DEF_RATING from its players'
+  *prior-season* individual stats only, with all on-court team context forbidden,
+  so it is non-circular by construction (unlike the three excluded approaches
+  below). Real but small signal under rolling-origin CV: season-centered
+  lineup-level R² ≈ 0.06 (95% CI includes zero) against a label-noise ceiling of
+  0.33, and a team-level calibration of `DRtg_used = 37.85 + 0.679 × DRtg_est`
+  (R² ≈ 0.23) that still beats predicting the league average by only ~4% of
+  team-level MAE. Retained as a standalone experiment; DEF_RATING stays dropped
+  from the aggregation.
 - **Planned, not built:** coaching adjustment; era adjustment for cross-era
   rosters; style/fit intangibles.
 

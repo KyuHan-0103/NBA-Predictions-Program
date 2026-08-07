@@ -51,6 +51,11 @@ Validation
 ----------
 For each real team this season, take its qualifying players, aggregate them, and
 compare the synthetic line to the team's actual line from team_season_stats.csv.
+
+The per-feature error-impact diagnostics (perturbation_impact() and the
+deprecated MAPE x coefficient ranking) live in perturbation_tests.py. main()
+below still runs and prints them exactly as before, via
+run_perturbation_tests(); that file can also be run on its own.
 """
 
 from __future__ import annotations
@@ -301,67 +306,6 @@ def compare(agg: pd.Series, real: pd.Series) -> pd.DataFrame:
     return out
 
 
-def error_impact_deprecated(mape: pd.Series, coefs: pd.Series) -> pd.DataFrame:
-    """DEPRECATED -- see perturbation_impact() for the replacement.
-
-    Crosses per-feature aggregation MAPE with the ridge model's standardized
-    coefficients (mape_pct * |coef|) as a proxy for prediction-facing error.
-    This is unreliable when features are collinear with offsetting
-    coefficients: PACE and POSS correlate at ~0.99 here but carry large
-    coefficients of opposite sign (PACE ~-0.29, POSS ~+0.13), so either
-    coefficient's magnitude alone overstates how much *that feature's* error
-    actually moves a prediction -- some of it is cancelled by the other.
-    Kept only so its ranking can be printed alongside perturbation_impact()'s
-    for comparison; do not use this to decide which aggregation error matters.
-    """
-    out = pd.DataFrame({"mape_pct": mape, "coef": coefs, "abs_coef": coefs.abs()})
-    out["impact"] = out["mape_pct"] * out["abs_coef"]
-    return out.sort_values("impact", ascending=False)
-
-
-def perturbation_impact(
-    model,
-    real_lines: pd.DataFrame,
-    mape: pd.Series,
-    feature_cols: list[str],
-) -> pd.DataFrame:
-    """Rank features by how much perturbing them actually moves the model's
-    predicted win rate -- a direct replacement for error_impact_deprecated().
-
-    For each feature, and for each of the 30 real teams in `real_lines`, that
-    team's real stat line is perturbed by the aggregation's measured MAPE for
-    that feature (both +MAPE% and -MAPE%, one feature at a time, all others
-    held at their real value), re-predicted with the already-fitted `model`,
-    and the change in predicted wins (delta W_PCT * 82) is recorded. The
-    table reports, per feature, the mean (over both directions and all 30
-    teams) of the absolute win-count change -- this is what "the model
-    actually cares" should mean, instead of a standardized-coefficient proxy
-    that collinearity can make misleading (see error_impact_deprecated()).
-
-    Known limitation: this is a one-at-a-time perturbation, which assumes
-    each feature's aggregation error is independent of the others' -- that
-    assumption is false here. PACE, POSS, FGA, and PTS errors all originate
-    in the same usage-scaling step (see aggregate_team()'s conserve_usage
-    scaling), so in practice they move together, not independently, and this
-    diagnostic cannot capture that correlated, simultaneous error. Treat it
-    as a per-feature sensitivity ranking, not a bound on the aggregation's
-    real combined error.
-    """
-    X = real_lines[feature_cols]
-    baseline = model.predict(X)
-    rows = []
-    for feat in feature_cols:
-        frac = mape[feat] / 100.0
-        X_plus, X_minus = X.copy(), X.copy()
-        X_plus[feat] = X[feat] * (1.0 + frac)
-        X_minus[feat] = X[feat] * (1.0 - frac)
-        delta_plus = (model.predict(X_plus) - baseline) * GAMES_PER_SEASON
-        delta_minus = (model.predict(X_minus) - baseline) * GAMES_PER_SEASON
-        mean_abs_win_impact = np.mean((np.abs(delta_plus) + np.abs(delta_minus)) / 2.0)
-        rows.append({"feature": feat, "mape_pct": mape[feat], "mean_abs_win_impact": mean_abs_win_impact})
-    return pd.DataFrame(rows).set_index("feature").sort_values("mean_abs_win_impact", ascending=False)
-
-
 def load_lineups(poss_floor: float = LINEUP_POSS_FLOOR) -> pd.DataFrame:
     """Real 5-man lineups (from pull_lineups.py) clearing `poss_floor`
     season-total possessions -- see LINEUP_POSS_FLOOR for why."""
@@ -578,37 +522,13 @@ def main() -> None:
     R = teams.loc[ids, feature_cols].astype(float)
 
     # --- Two rankings of "real" per-feature error impact, for comparison ---
-    # error_impact_deprecated: mape_pct * |standardized ridge coef| -- unreliable
-    # under collinearity (see its docstring). perturbation_impact: actually
-    # perturbs each feature by its measured MAPE and re-predicts, averaged over
-    # all 30 teams -- the direct replacement.
-    coefs = pd.Series(model.named_steps["ridgecv"].coef_, index=feature_cols)
-    impact_old = error_impact_deprecated(mape, coefs)
-    impact_new = perturbation_impact(model, R, mape, feature_cols)
+    # Both live in perturbation_tests.py now (identical tests, printed here
+    # exactly as before). The import is function-local on purpose: that module
+    # imports this one for load_players/aggregate_team, so a module-level import
+    # here would be a cycle.
+    from perturbation_tests import run_perturbation_tests
 
-    print("\n=== [DEPRECATED] MAPE x ridge coefficient: real error impact (desc) ===")
-    with pd.option_context("display.float_format", lambda v: f"{v:.4f}"):
-        print(impact_old.to_string())
-
-    print("\n=== Perturbation test: mean abs win impact per feature (desc) ===")
-    with pd.option_context("display.float_format", lambda v: f"{v:.4f}"):
-        print(impact_new.to_string())
-
-    # --- Where the two rankings disagree ---
-    rank_cmp = pd.DataFrame({
-        "old_rank": impact_old["impact"].rank(ascending=False),
-        "new_rank": impact_new["mean_abs_win_impact"].rank(ascending=False),
-    })
-    rank_cmp["rank_diff"] = (rank_cmp["old_rank"] - rank_cmp["new_rank"]).abs()
-    disagreements = rank_cmp.sort_values("rank_diff", ascending=False).head(8)
-    print("\n=== Biggest ranking disagreements (old vs. perturbation) ===")
-    print(disagreements.to_string())
-    print(
-        "Expect PACE/POSS to disagree most: their ~0.99 correlation and offsetting\n"
-        "coefficients (PACE ~-0.29, POSS ~+0.13) let the deprecated method's\n"
-        "coefficient-magnitude proxy overstate/understate impact that the\n"
-        "perturbation test measures directly."
-    )
+    run_perturbation_tests(model, R, mape, feature_cols)
 
     pred_real = float(model.predict(real_line.to_frame().T)[0])
     pred_agg = float(model.predict(agg_line.to_frame().T)[0])
