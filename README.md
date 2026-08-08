@@ -211,35 +211,38 @@ largest swing a coefficient can produce, not a typical one.
 
 ## Test log
 
-**A separate feature set for the fictional path — built, measured, and
-reverted.** The 27-feature model's coefficients do not read as basketball:
-`OFF_RATING` fits at **−0.877** log-odds per SD, `AST` at −0.536, `TOV` at
-**+0.550**, and 7 of 16 priced features come out backwards. Three exact or
-near-exact linear dependencies cause it — `PTS == 2·FGM + FG3M + FTM` (max abs
-diff 4.3e-14), `POSS ≈ FGA + 0.44·FTA + TOV − OREB` (corr 0.988), `REB == OREB +
-DREB` — plus `OFF_RATING ≡ 100·PTS/POSS` at corr 0.999981. Ridge cannot remove a
-dependency; it picks one of infinitely many equally-good coefficient splits, and
-that split is only valid where the dependency holds as it does in training.
+Each entry: *what was tested → what the evidence showed → what was decided.*
+Decisions came from experiments, not intuition, and the ones that were reversed
+are marked rather than deleted.
 
-*The hypothesis:* an aggregated roster is where those offsetting pairs stop
-cancelling, because usage conservation scales `PTS` while `POSS` is derived from
-the scaled totals — so a feature set without the redundancy should predict
-rosters better even if it fits real teams slightly worse.
+### Feature set for the fictional path — built, measured, reverted
 
-*What was built.* A 12-column rates-and-defence set (`OFF_RATING`, `EFG_PCT`,
+*Tested.* The 27-feature model's coefficients don't read as basketball:
+`OFF_RATING` **−0.877** log-odds per SD, `AST` −0.536, `TOV` **+0.550** — 7 of 16
+priced features backwards. The cause is exact linear dependency:
+
+```
+PTS  == 2*FGM + FG3M + FTM            (exact, max abs diff 4.3e-14)
+POSS ~= FGA + 0.44*FTA + TOV - OREB   (corr 0.988)
+REB  == OREB + DREB                   (exact)
+OFF_RATING == 100 * PTS / POSS        (corr 0.999981)
+```
+
+Ridge can't remove a dependency — it picks one of infinitely many equally-good
+coefficient splits, valid only where the dependency holds as it does in training.
+The hypothesis was that an aggregated roster breaks that, since usage conservation
+scales `PTS` while `POSS` is derived from the scaled totals.
+
+*Built.* A 12-column rates-and-defence set (`OFF_RATING`, `EFG_PCT`,
 `TM_TOV_PCT`, `AST_RATIO`, `OREB_PCT`, `DREB_PCT`, `PACE`, `STL`, `BLK`, `BLKA`,
-`PF`, `PFD`) with four sign assertions raising `SignViolation` at fit time. Note
-that pruning only `PTS`/`POSS`/`REB` does **not** work: those columns are
-reconstructable from the ones that remain, and `OFF_RATING` still fits at −0.40
-with 5 of 8 signs wrong. The counting stats and the derived rates span the same
-space, so one side of the span has to go.
+`PF`, `PFD`) with four sign assertions. Pruning only `PTS`/`POSS`/`REB` does **not**
+work — they're reconstructable from what remains, and `OFF_RATING` still fits at
+−0.40. The counting stats and the derived rates span the same space, so one whole
+side has to go.
 
-*It worked on its own terms.* 0 of 11 expected signs wrong instead of 8 of 16,
-for 0.23 wins of holdout MAE (5.08 vs 4.85).
-
-*Why it was reverted — the hypothesis was tested and failed.* Scored against
-real teams' actual win totals from their own aggregated 15-man rosters — the only
-end-to-end validation this project has — the smaller set is **twice as bad**:
+*Evidence.* It worked on its own terms — 0 of 11 signs wrong for 0.23 wins of
+holdout MAE. But scored against real teams' actual win totals from their own
+aggregated rosters, the only end-to-end validation available:
 
 | Feature set | Holdout MAE | R² | Aggregated rosters vs actual wins |
 |---|---:|---:|---:|
@@ -247,620 +250,442 @@ end-to-end validation this project has — the smaller set is **twice as bad**:
 | 12 (reverted) | 5.08 W | 0.783 | 15.2 W |
 | variant: `DREB` for `DREB_PCT` | 3.97 W | 0.864 | 10.0 W |
 
-The mechanism is visible in the aggregation's own per-feature validation: pruning
-15 counting stats that aggregate at under 5% MAPE concentrates the model's weight
-onto `DREB_PCT` (7.5% MAPE) and `OREB_PCT` (25.3%) — the two opponent-dependent
-approximations, and the only two the aggregation itself flags low-confidence. The
-stress rosters moved the same way: five All-Star guards 52-30 → 28-54, five
-low-usage role players 68-14 → 31-51, five elite shooters 11-71 → **1-81**.
+Twice as bad. Pruning 15 counting stats that aggregate at under 5% MAPE
+concentrates weight onto `DREB_PCT` (7.5% MAPE) and `OREB_PCT` (25.3%) — the two
+approximations the aggregation itself flags low-confidence. Stress rosters moved
+the same way: five All-Star guards 52-30 → 28-54, five elite shooters 11-71 →
+1-81.
 
-*And the one apparent win did not survive a control.* The 12-feature set appeared
-to fix the guard's always-fires problem: median ratio 1.70x → 1.08x, flagged 100%
-→ 65%. But scoring **random 12-column subsets** of the same 27 gives a median of
-**0.92x** (range 0.60–1.25x over 8 draws) — *better* than the deliberately chosen
-12. Mahalanobis distance in 12 dimensions is simply smaller than in 27: fewer
-dimensions, fewer chances to be an outlier. The guard improvement was a
-dimensionality artifact, not evidence about the feature set.
+*And the one apparent win was an artifact.* The 12 seemed to fix the guard's
+always-fires problem (median ratio 1.70x → 1.08x, flagged 100% → 65%). But random
+12-column subsets of the same 27 score a median of **0.92x** — better than the
+deliberately chosen 12. Mahalanobis distance in 12 dimensions is smaller than in
+27 regardless of which 12.
 
-*Decision:* **reverted.** The fictional path is back on all 27 features. The
-theory and the measurement pointed opposite ways and the measurement won — which
-is the same rule that retracted the continuity effect, the hustle-stat gain and
-the possession-floor choice earlier in this log. The one honest defence left for
-the 12 is that aggregated real 15-man rosters sit at 1.7x the guard limit while a
-cross-era five sits at 7–9x, so the test does not reach the regime the tool
-actually operates in — but "better in a regime I cannot measure" is not a claim
-this project accepts from itself.
+*Decision:* **reverted.** Theory and measurement disagreed and the measurement
+won. The residual defence — aggregated real rosters sit at 1.7x the guard limit
+while a cross-era five sits at 7–9x, so the test doesn't reach the real regime —
+is unfalsifiable and is recorded as an open question, not used to override a
+measurement. Kept from the experiment: `coefficient_signs()`, printed every run,
+asserting nothing. The `DREB` variant dominated the 12 on every axis and is the
+first thing to test if this is revisited (see Limitations).
 
-*What was kept.* The `*_PCT` contract clip (Task 1), the stress rosters (Task 3),
-the prediction intervals (Task 4), and `coefficient_signs()` — printed on every
-run, nothing asserted. The sign problem is real and unresolved; printing it at the
-point of use is the honest response to a fix that cost more than it bought. The
-`DREB`-for-`DREB_PCT` variant is the one configuration that dominated the 12 on
-every axis and is recorded below as the thing to test first if this is revisited.
+*Standing rule:* before believing a metric moved because of your change, build
+the cheapest null version of that change and check whether it moves anyway.
 
+### `*_PCT` clipped to the contract, with the clip reported
 
-The decisions below were made from experiments, not intuition. Each is recorded
-as *what was tested → what the evidence showed → what was decided*, so the
-reasoning survives and isn't rebuilt from scratch.
+*Tested.* The contract requires every `*_PCT` output to be a fraction in [0, 1],
+and `SHARE_COLS` had no upper bound — the five-centre roster produced
+`DREB_PCT` = **1.482**, a team securing 148% of the opponent's misses.
 
-**A separate, smaller feature set for the fictional path — tested and
-rejected.** The 27-feature model's coefficients do not read as basketball. Fit
-on real teams, `OFF_RATING` comes out at **−0.88**, `DREB_PCT` at −0.12, `AST`
-at −0.34, `TOV` at **+0.34** — 7 to 8 of the 16 features with a defensible
-expected sign come out backwards, depending on which seasons the fit sees. That
-costs nothing on real teams (test MAE 4.85 wins, R² 0.813): the offsetting pairs
-cancel because the features move together in every row the model was fit on. A
-roster is the row where they stop moving together, and there each coefficient is
-applied on its own. So a feature set chosen to avoid that was built, measured,
-and **not kept** — the reasoning and the numbers are below because the concern
-is real even though the fix was worse.
+*Approach.* Two mechanisms, because the two kinds fail differently. The
+opponent-dependent approximations (`OREB_PCT`, `DREB_PCT`) are **clipped**, with
+every clip recorded in `result.attrs["pct_clipped"]` as `{col: pre-clip value}` so
+a caller can tell a clipped line from a clean one. Every other `*_PCT` is
+recomputed from the roster's own totals and cannot honestly leave range, so those
+**raise** (`_check_pct_range`) — clipping them would turn a formula bug into a
+plausible number.
 
-*Why pruning is not the fix.* The obvious repair — drop `PTS`, `POSS`, `REB` —
-does not work, because those columns are reconstructable from the ones that
-remain: `PTS == 2*FGM + FG3M + FTM` (exact, max abs diff 4.3e-14), `POSS ~= FGA
-+ 0.44*FTA + TOV − OREB` (corr 0.988), `REB == OREB + DREB` (exact). With all
-three dropped, `OFF_RATING` still fits at −0.40 and `DREB_PCT` at −0.12: 5 of 8
-signs still wrong. The counting stats and the derived rates span the same
-space; keeping both leaves the rates free to take arbitrary offsetting values.
+*Evidence.* The clip fires on one of five stress rosters (five centres, 1.482 →
+1.000) and no real team's aggregated rotation trips it. *Decision:* **integrated.**
 
-*What was tried.* Rates and defence only, no raw offensive counting stats:
-`OFF_RATING, EFG_PCT, TM_TOV_PCT, AST_RATIO, OREB_PCT, DREB_PCT, PACE, STL,
-BLK, BLKA, PF, PFD`. Measured on the same chronological holdout:
+### Stress rosters, with the expected ordering stated first
 
-| Feature set | test MAE | test R² | expected signs wrong |
-|---|---:|---:|---:|
-| **full 27 (shipped)** | **4.85 W** | **0.813** | 8 of 16 |
-| 9 (rates + STL/BLK) | 5.41 W | 0.747 | 1 of 8 (`AST_RATIO` −0.03) |
-| 12 (rates + defence) | 5.08 W | 0.783 | 0 of 11 |
+Five roster shapes built from prime seasons, each reporting `usage_scale`, the
+predicted record and interval, the extrapolation ratio, and the three largest
+contributions to the predicted log-odds. `EXPECTED_STRESS_ORDER` is written into
+the source **before** the run, so a disagreement is a finding.
 
-It worked as intended on its own terms: the 12-column set's coefficients read
-as basketball (`EFG_PCT` +0.24, `STL` +0.17, `DREB_PCT` +0.16, `OFF_RATING`
-+0.15, `BLKA` −0.13, `TM_TOV_PCT` −0.08), for 0.23 wins of holdout MAE.
-
-*Why it was rejected: the 0.23 wins was not the price.* Scored against real
-teams' actual win totals, from their own aggregated 15-man rosters — which is
-the closest thing this project has to a test of the roster path — the same
-aggregated lines give **7.7 wins MAE under the 27-feature model and 12.9 under
-the 12**. The mechanism is visible in the aggregation's own per-feature
-validation: `OREB_PCT` (25.25% MAPE) and `DREB_PCT` (7.47%) are the two
-worst-aggregated features in the entire set — the opponent-dependent
-rebound-share approximations, the only two the aggregation itself flags
-low-confidence — and pruning 15 well-aggregated counting stats (most under 5%
-MAPE) concentrates the model's weight onto exactly them. `DREB_PCT` became the
-largest single log-odds contributor for four of the five stress rosters.
-*Decision:* **not used.** The fictional path scores on all 27 features, the
-same set `train_model.py` fits.
-
-*What the rejection does not resolve.* The 7.7 is produced by coefficients that
-are individually wrong and only correct in combination, on rows where that
-combination is not guaranteed to hold — which is exactly the objection the
-smaller set was built to answer, and it is unanswered rather than refuted.
-What the experiment established is that the obvious fix trades one known
-problem for a larger measured one. `aggregate_team.coefficient_signs()` now
-prints every coefficient with its expected sign annotated on each run, so the
-caveat is visible at the point of use; nothing is asserted, since a sign that
-cannot be argued from first principles is not a thing to fail a build over.
-A better answer would improve the rebound-share approximation first, which
-would raise the ceiling on both feature sets at once.
-
-*A footnote on why nothing here is asserted.* `PF` fits at −0.003 on the
-chronological-holdout training rows and **+0.014** refit on all 12 seasons; the
-27-feature model's wrong-sign count is 8 on one fit and 7 on the other, because
-`BLK` crosses zero too. At those magnitudes the sign is noise, and an assertion
-on it would pass or fail the identical model depending on which rows it saw.
-
-**`*_PCT` clipped to the contract, with the clip reported.** The aggregation
-contract requires every `*_PCT` output to be a fraction in [0, 1], and
-`SHARE_COLS` had no upper bound: the five-centre stress roster produces
-`DREB_PCT = 1.482`, a team securing 148% of the opponent's misses. *Approach:*
-two mechanisms, because the two kinds of `*_PCT` column fail differently. The
-opponent-dependent approximations (`OREB_PCT`, `DREB_PCT`) are **clipped**, and
-every clip that fires is recorded in `result.attrs["pct_clipped"]` as
-`{col: pre-clip value}` so a caller can tell a clipped line from a clean one.
-Every other `*_PCT` is recomputed from the roster's own totals and cannot
-honestly leave the range, so those **raise** (`_check_pct_range`) — clipping
-them would convert a formula or units bug into a plausible-looking number and
-leave the extrapolation report to notice, which is exactly the failure the
-contract exists to prevent. *Evidence:* of the five stress rosters, the clip
-fires on one (five centres, `DREB_PCT` 1.482 → 1.000) and none of the others;
-no real team's aggregated rotation trips it. *Decision:* **integrated.**
-
-**Stress rosters, with the expected ordering stated first.** Four lopsided
-roster shapes plus a balanced five, all built from prime seasons
-(`STRESS_ROSTERS`), each reporting `usage_scale`, the predicted record and
-interval, the extrapolation ratio, and the three largest per-feature
-contributions to the predicted log-odds. `EXPECTED_STRESS_ORDER` is written
-into the source **before** the run, so a disagreement is a finding and not an
-observation. Expected: balanced ≳ centres > ball-dominant guards > shooters.
-
-| Roster | `usage_scale` | predicted | ratio | largest contribution |
+| Roster | `usage_scale` | Predicted | Ratio | Largest contribution |
 |---|---:|---:|---:|---|
 | balanced five | 0.696 | 80-2 | 3.0x | `DREB` +2.45 |
 | 5 centres, no ball handling | **1.187** | 82-0 | **9.2x** | `REB` +6.92 |
-| 5 low-usage role players | **1.467** | 61-21 | 3.7x | `PACE` +1.38 |
-| 5 ball-dominant guards | 0.550 | 47-35 | 2.2x | `REB` −0.99 |
-| 5 short off-ball shooters | 0.733 | 10-72 | 4.0x | `DREB` −2.42 |
+| 5 low-usage role players | **1.467** | 68-14 | 3.7x | `PACE` +1.38 |
+| 5 ball-dominant guards | 0.550 | 52-30 | 2.2x | `REB` −0.99 |
+| 5 short off-ball shooters | 0.733 | 11-71 | 4.0x | `DREB` −2.42 |
 
-*Findings, none of them tuned toward.* **(a)** The realised ordering is
-centres > balanced > guards > shooters: the top two swap. **(b)** The
-low-usage five was included to exercise the one regime nothing else had —
-`usage_scale` **above** 1.0, the aggregation scaling volume *up* rather than
-down — and it does (1.467), but so do the five centres (1.187), which was not
-expected: five non-creators' summed volume falls short of their own pace anchor
-just as five role players' does. The scale-up path had never been exercised
-before this and now has two cases. **(c)** The five-centre prediction (82-0, at
-a 9.2x extrapolation ratio) is implausible as basketball and is documented as a
-limitation, not a target. Its two largest contributions are `REB` and `DREB` —
-rebounding volume, rescaled to 240 minutes for five of the best rebounders who
-ever played — and its `DREB_PCT` reached the model only after being clipped from
-1.482 to 1.000. **(d)** Five low-usage defensive specialists predict 61-21,
-which is generous for a roster that cannot score; `PACE` is its largest positive
-term, and `PACE` carries this model's single largest coefficient (−0.98 per SD)
-with no defensible expected sign. *Decision:* recorded in Limitations.
+*Findings, none tuned toward.* **(a)** Expected balanced ≳ centres > guards >
+shooters; realised **centres > balanced** — the top two swap. **(b)** The
+`usage_scale > 1` regime had never been exercised; the low-usage five was built to
+hit it (1.467) and does, but so do the five centres (1.187), which was not
+expected — five non-creators' summed volume falls short of their own pace anchor
+just as five role players' does. **(c)** 82-0 for five centres is implausible and
+traceable: their `DREB_PCT` reached the model only after clipping from 1.482, and
+a clipped 1.000 reads as the best defensive rebounding any team has posted.
+Nothing in the feature set encodes position, so the model can't know that roster
+has no ball handler. *Decision:* recorded in Limitations.
 
-**A 90% interval on every win-rate prediction.** A predicted record with no
-interval invites being read as precise; an interval built the obvious way is
-worse, because it looks quantified while omitting its largest term. *Approach:*
-three requirements, each of which the obvious implementation gets wrong.
-**(1)** Built on the **logit scale** and transformed back —
-`inv_logit(z ± 1.645·sd)` — so it is correctly asymmetric near the bounds. A
-symmetric band in `W_PCT` around a predicted 0.95 runs past 1.0 and quotes wins
-that do not exist. **(2)** Two components reported **separately**, never
-blended into one number: *model error*, the SD of held-out residuals on the
-logit scale (**0.270** log-odds), and *outcome randomness*, which is
-irreducible and exact — a
-season is 82 Bernoulli trials, so a realised rate has SD `sqrt(p(1-p)/82)`.
-Combining them requires a shared scale, so the outcome SD is carried to
-log-odds by the delta method (`1/sqrt(82·p·(1−p))`) and the two add in
-quadrature. Reference values, reproduced exactly by `prediction_interval()`:
+### A 90% interval on every win-rate prediction
+
+Three requirements, each of which the obvious implementation gets wrong.
+
+**(1) Built on the logit scale** and transformed back — `inv_logit(z ± 1.645·sd)`
+— so it comes out correctly asymmetric near the bounds. A symmetric band around a
+predicted 0.95 runs past 1.0 and quotes wins that don't exist.
+
+**(2) Two components, never blended into one number.** *Model error*: SD of
+held-out residuals on the logit scale, **0.270** log-odds. *Outcome randomness*:
+irreducible and exact — a season is 82 Bernoulli trials, so a realised rate has SD
+`sqrt(p(1−p)/82)`. Combining needs a shared scale, so the outcome SD is carried to
+log-odds by the delta method and the two add in quadrature. Reproduced exactly by
+`prediction_interval()`:
 
 | Predicted | Model error | Outcome only | Combined |
 |---|---|---|---|
-| 41W | 32–50 | 34–48 | 30–52 |
-| 57W | 49–64 | 51–64 | 46–66 |
-| 70W | 64–74 | 64–75 | 61–75 |
-| 78W | 76–79 | 75–81 | 72–80 |
+| 41 W | 32–50 | 34–48 | 30–52 |
+| 57 W | 49–64 | 51–64 | 46–66 |
+| 70 W | 64–74 | 64–75 | 61–75 |
+| 78 W | 76–79 | 75–81 | 72–80 |
 
-**(3)** What it does *not* cover is printed with it and deliberately left
-unquantified: the dropped `DEF_RATING` (worth **2.3 wins** of MAE on real
-teams — 4.85 without vs 2.53 with) and the roster's own extrapolation ratio.
-Neither is quantifiable from available data, and inventing a term for them
-would be the one failure mode worse than having no interval at all.
+**(3) What it does not cover is printed with it, unquantified:** the dropped
+`DEF_RATING` (worth **2.3 wins** of MAE on real teams — 4.85 without vs 2.53 with)
+and the roster's extrapolation ratio. Neither is quantifiable from available data,
+and inventing a term would be worse than having no interval.
 
-*A degenerate case the delta method has, and how it is reported.* As a
-prediction approaches a bound, log-odds stretches without limit, so the
-combined band widens rather than narrowing — at full saturation it covers 0-82
-while the model-error band still reads 82-82. That is the transform being
-honest (a saturated prediction has no resolution left), but printed bare it
-looks like a measurement. `prediction_interval()` flags the symptom
-(`degenerate`: the combined band spans ≥90% of the season) and `interval_report()`
-says so in words instead of quoting the range. The five-centre roster is the
-live case. *Decision:* **integrated**, on both `predict_fictional_roster.py`
-and every stress roster.
+*A degenerate case, flagged rather than printed.* As a prediction approaches a
+bound, log-odds stretches without limit, so the combined band gets *wider* even as
+the win counts pin — at full saturation it covers 0-82 while the model-error band
+reads 82-82. That's the transform being honest, but printed bare it looks
+measured, so `prediction_interval()` flags a band spanning ≥90% of the season and
+`interval_report()` says so in words. The five-centre roster is the live case.
+*Decision:* **integrated** everywhere a record is printed.
 
-**Logit target for the win-rate model, plus an extrapolation guard.** `W_PCT` is
-a proportion bounded in `[0, 1]`, and a ridge line fit directly on it has no
-stop at either end. On real teams that never bites — every team-season sits in
-`0.122–0.890`, and predictions stay inside the interval — but the fictional path
-is exactly where it does. *Approach:* fit `logit(p) = ln(p / (1-p))` and invert
-with `1 / (1 + e^-z)`, via `TransformedTargetRegressor`, so `build_model()`'s
-signature is unchanged (callers still pass and read plain `W_PCT`) and the bound
-becomes structural rather than hoped for. `logit()` clips at `1e-6` off each
-pole; the clip never binds on real data (no 0-82 or 82-0 season exists in the
-sample) and is there so the transform is total.
+### Logit target, plus an extrapolation guard
 
-*Evidence — accuracy is a wash, boundedness is not.* Both models fit on
-identical rows, scored on the `W_PCT` scale:
+*Tested.* `W_PCT` is a proportion bounded in [0, 1] and a ridge line has no stop
+at either end. On real teams that never bites, but the five-star stress roster
+predicted **1.004** with conservation on and **−2.609** with it off, and one *real*
+aggregated team line came back at **−0.048**.
 
-| Rows scored | linear MAE | logit MAE | linear raw range | logit raw range |
-|---|---:|---:|:--|:--|
-| Chronological holdout (60 team-seasons) | 4.92 W | **4.85 W** | in `[0,1]` | in `[0,1]` |
-| Real team lines, current season | 4.9 W | **4.6 W** | `[+0.215, +0.841]` | `[+0.220, +0.814]` |
-| Aggregated rosters, conservation ON | **7.4 W** | 7.5 W | `[+0.082, +0.868]` | `[+0.140, +0.836]` |
-| Aggregated rosters, conservation OFF | 13.1 W | **12.5 W** | `[−0.048, +0.989]` | `[+0.084, +0.895]` |
+*Approach.* Fit `logit(p)` and invert with the logistic, via
+`TransformedTargetRegressor`, so callers still pass and read plain `W_PCT` and the
+bound becomes structural. `logit()` clips 1e-6 off each pole; the clip never binds
+on real data (the 360-team span is 0.122–0.890).
 
-Test R² 0.806 → 0.813. Across eight one-season-ahead holdouts the two trade
-wins season by season (four each, all within 0.3 wins). This is the expected
-result and not a disappointment: the logistic is near-linear across the
-`0.12–0.89` band real teams occupy, so on real teams the transform has almost
-nothing to do. It earns its place at the extremes — the five-star stress roster
-predicted **1.004** (a "200-win season") under the linear model with
-conservation on and **−2.609** with it off; both are now 0.881 and 0.000. One
-real aggregated team line also came out at −0.048 under the linear model.
-*Decision:* **integrated.** The accuracy case is neutral; the correctness case
-is that the fictional path is the whole point of the program and it is the path
-that produced impossible numbers.
+*Evidence — accuracy is a wash, boundedness is not.*
 
-*The cost of the fix, and the guard that pays it.* Bounding the output removes
-the tell. A win rate of 2.44 announces itself as nonsense; a clean-looking 82-0
-does not, and it is what a saturated logistic returns. So `train_model.py` also
-ships `fit_extrapolation_guard()`: Mahalanobis distance from the training teams'
-center on standardized features (Ledoit-Wolf shrunk covariance — PACE and POSS
-correlate at ~0.99, leaving the raw covariance near-singular), with both
-thresholds read off the real teams themselves rather than from a chi-square
-table, since multivariate normality is not something this data has to honor.
-`edge` is the 99th-percentile training distance (5.78), `limit` is the maximum
-(6.36) — the point where extrapolation begins, past which no real team-season
-in the sample speaks to the row. A per-feature bounding box alone would not do:
-the ordinary five-man rotation used to check this breaks exactly one feature's
-range while landing 2.1× out, because what is wrong with it is the
-*combination*, which is what a covariance-aware distance sees and a range check
-does not.
+| Rows scored | linear | logit |
+|---|---:|---:|
+| Chronological holdout | 4.92 W | **4.85 W** |
+| Aggregated rosters, conservation ON | **7.4 W** | 7.5 W |
+| Aggregated rosters, conservation OFF | 13.1 W | **12.5 W** |
+| Five-star roster, ON / OFF | 1.004 / −2.609 | **0.881 / 0.000** |
 
-*Calibrating the threshold.* Walking the guard forward one season at a time
-(fit on seasons 1..k, score season k+1; 8 folds, 240 unseen real teams), 4.2% of
-genuinely real teams stepped past the prior seasons' maximum, and the worst ever
-reached **1.13×** it. So a ratio near 1.0 means "a team shape the league hadn't
-produced yet," which happens, and the flag's magnitude — not the flag — is the
+Expected: the logistic is near-linear across the band real teams occupy, so on
+real teams the transform has almost nothing to do. It earns its place at the
+extremes, which is the whole point of the program. *Decision:* **integrated.**
+
+*The cost of the fix, and the guard that pays it.* Bounding the output removes the
+tell — a win rate of 2.44 announces itself as nonsense, a clean-looking 82-0 does
+not. So `fit_extrapolation_guard()` measures Mahalanobis distance from the
+training centre on standardized features (Ledoit-Wolf shrunk purely for
+conditioning, since `PACE`/`POSS` correlate at ~0.99), with both thresholds read
+off the real teams rather than a chi-square table: `edge` = 5.78 (99th pct),
+`limit` = 6.36 (max). A per-feature bounding box would not do — an ordinary
+five-man rotation breaks exactly one feature's range while landing 2.1x out,
+because what's wrong with it is the *combination*.
+
+*Calibrating the threshold.* Walking the guard forward one season at a time (8
+folds, 240 unseen real teams), 4.2% of genuinely real teams stepped past the prior
+seasons' maximum, and the worst reached **1.13x**. So a ratio near 1.0 means "a
+team shape the league hadn't produced yet," and the flag's *magnitude* is the
 signal.
 
-*Evidence — the flag fires on everything, which is itself the finding.* Measured
-across 180 real team-seasons:
+*Evidence — the flag fires on everything, which is itself the finding.*
 
-| Row shape | distance | ratio to `limit` | flagged |
-|---|---:|---:|---:|
-| Real team-season the guard never saw | ≤ 7.0 | ≤ 1.13× | 4.2% |
-| Real team's own top-15 rotation, aggregated | median 10.9 | 1.7× (max 2.4×) | **100%** |
-| Real team's own top-5 rotation, aggregated | median 12.0 | 1.9× (max 3.3×) | **100%** |
-| Five-star stress roster, conservation ON | 32.5 | 5.1× | 100% |
-| Cross-era five-star roster | 40.5 | 6.4× | 100% |
-| Five-star stress roster, conservation OFF | 58.4 | 9.2× | 100% |
+| Row shape | ratio to `limit` | flagged |
+|---|---:|---:|
+| Real team-season the guard never saw | ≤ 1.13x | 4.2% |
+| Real team's own top-15 rotation, aggregated | 1.7x (max 2.4x) | **100%** |
+| Real team's own top-5 rotation, aggregated | 1.9x (max 3.3x) | **100%** |
+| Five-star roster, conservation ON | 5.1x | 100% |
+| Cross-era five-star roster | 6.4x | 100% |
+| Five-star roster, conservation OFF | 9.2x | 100% |
 
 Every roster that goes through `aggregate_team()` lands outside the real-team
-cloud — including a real team's own starting five, whose actual season really
-happened. The aggregation step displaces a line off that cloud by itself,
-before any fictional-ness enters (rescaling five players to 240 minutes puts
-DREB and PFD past any real team's range, among others). *Decision:* keep the
-threshold defined by the 360 real teams — that genuinely is where the model's
-evidence ends — but report the **ratio** as the headline, with the measured
-scale above printed alongside it, and record that the boolean is a constant on
-the roster path. A flag that always fires is worth nothing; a ratio that
-separates an ordinary rotation (1.9×) from a stacked five (5.1×) by 2.7× is
-worth something. This is not a defect the guard introduced, it is a property of
-the aggregation that nothing had previously measured.
+cloud — including a real team's own starting five, whose season actually happened.
+The aggregation displaces a line by itself, before any fictional-ness enters,
+mostly through the rescale to 240 minutes. *Decision:* keep the threshold defined
+by the 360 real teams, but report the **ratio** as the headline with the measured
+scale alongside, and record that the boolean is a constant on the roster path. A
+flag that always fires is worth nothing; a ratio separating an ordinary rotation
+(1.9x) from a stacked five (5.1x) is worth something.
 
-*Footnote from the rejected 12-feature experiment.* Every ratio above is a
-distance in 27-dimensional feature space, and the scale is not portable: guarded
-on the 12 rate-and-defence columns instead, the same real 15-man rotations sit
-at a median of 1.1× (73% flagged rather than 100%) and the five-star roster at
-2.8× rather than 5.1×. Most of the displacement measured above is the rescale to
-240 minutes pushing `DREB` and `PFD` past every real team's range, so a feature
-set without them looks much less exotic without being any more supported. Worth
-knowing before comparing a ratio to one measured elsewhere; the shipped guard is
-the 27-feature one.
+### Ridge vs. gradient boosting (real-team model)
 
-**Ridge vs. gradient boosting (real-team model).** Compared at several dataset
-sizes. Gradient boosting overfit heavily on small data and never overtook ridge:
-
-| Training rows | GB train R² | GB test R² | GB gap |
-|---------------|-------------|------------|--------|
+| Training rows | GB train R² | GB test R² | gap |
+|---|---:|---:|---:|
 | 300 (10 seasons) | 0.986 | 0.916 | 0.070 |
 | 360 (12 seasons) | 0.981 | 0.919 | 0.062 |
 | 540 (18 seasons) | 0.973 | 0.931 | 0.042 |
 
-*Decision:* ridge is the production model. Season-level prediction is inherently
-small-data (~30 team-seasons per year), which favors a simple regularized linear
-model. Gradient boosting is not shipped.
+*Decision:* ridge ships. ~30 team-seasons per year is inherently small data, which
+favours a simple regularized linear model. (GB lost again on the lineup defensive
+model, with 10x the rows — see below.)
 
-**TM_TOV_PCT formula bug.** The aggregated turnover rate used a plays-based
-denominator (`FGA + 0.44·FTA + TOV`) while the team CSV stores a possession-based
-one (`TOV / POSS`), biasing it low on every team. Because it's a high-coefficient
-feature, the error inflated predicted wins across the board. *Decision:* fixed the
-denominator; aggregated win-MAE dropped from **14.3 → 6.5**. Established the
-standing rule that a derived rate must match the CSV column's exact definition,
-not just its units.
+### `TM_TOV_PCT` formula bug
 
-**DEF_RATING sub-model.** Tested whether team DEF_RATING could be predicted from
-aggregatable defensive box-score stats (steals, blocks, defensive rebounds,
-fouls, pace). *Evidence:* test R² ≈ 0.19 — the box score doesn't carry team
-defense. Swapping the real DEF_RATING for this prediction was no better than
-dropping the column entirely. *Decision:* not used.
+The aggregated turnover rate used a plays-based denominator (`FGA + 0.44·FTA +
+TOV`) while the team CSV stores a possession-based one (`TOV / POSS`), biasing it
+low on every team. Because it's a high-coefficient feature, this inflated
+predicted wins across the board. *Decision:* fixed; aggregated win-MAE dropped
+**14.3 → 6.5**. *Standing rule:* a derived rate must match the CSV column's exact
+**definition**, not merely its units.
 
-**DEF_RATING personal composite.** A single feature built by regressing personal
-defensive stats against real DEF_RATING, replacing both DEF_RATING and its raw
-inputs. *Evidence:* it barely beat dropping the column on real-team *training*
-(~7.57 vs. ~7.60 wins MAE), and that edge traced to collapsing four collinear
-columns into one (a mild regularization effect) rather than to recovered defensive
-signal; it vanished through aggregation. *Decision:* not used.
+### `DEF_RATING` synthesis — four attempts, none shipped
 
-**DEF_RATING awards composite.** A rule-based score from DPOY / All-Defensive
-selections plus box-score defensive character. *Evidence:* equal to or worse than
-simply dropping DEF_RATING. *Decision:* not used.
+| Attempt | Approach | Evidence | Decision |
+|---|---|---|---|
+| Sub-model | Predict team `DEF_RATING` from aggregatable defensive box-score stats | test R² ≈ 0.19; no better than dropping the column | not used |
+| Personal composite | One feature regressing personal defensive stats on real `DEF_RATING` | 7.57 vs 7.60 wins MAE, and the edge traced to collapsing four collinear columns (a regularization effect), not recovered signal; vanished through aggregation | not used |
+| Awards composite | Rule-based score from DPOY / All-Defensive selections | equal to or worse than dropping | not used |
+| Prior-season lineup model | See the dedicated entry below | real but small (~4% of team-level MAE) | not integrated |
 
-**DEF_RATING — final.** All synthesis routes failed for the same structural
-reason: DEF_RATING is opponent-dependent and a fictional roster has no honest way
-to produce it. *Decision:* **dropped** from the fictional-roster path. The
-resulting ~7.6-win aggregated MAE is accepted as an honest floor rather than
-papered over. (The real-team model in `train_model.py` still uses real
-DEF_RATING; only the fictional path drops it.)
+A fifth option scored **best** of everything tried (~6.5 wins) and was rejected:
+a minutes-weighted average of the players' own real `DEF_RATING`. A player's
+`DEF_RATING` is the *team's* points allowed while he was on the floor, so
+averaging a team's players returns approximately that team's own rating — it
+scored well *because* it was circular, and the circularity vanishes on a
+cross-era roster.
 
-**Possession conservation.** Summing five players' box-score volume can imply more
-possessions than a real game contains. *Approach:* anchor the roster to a
-possession target = minutes-weighted average of the players' own PACE (validated:
-tracks real team PACE at ~1.4% mean abs error, corr 0.985), then scale volume so
-possessions match it. *Evidence:* possession-denominated rates (OFF_RATING,
-TM_TOV_PCT) are provably invariant to the scaling (ON vs OFF differ by ~1e-14);
-`usage_scale` is ≈ 1.0 on real teams (their players already fit together) and
-**0.56 on a five-star stress roster** (where the ball genuinely can't stretch to
-fit five ball-dominant scorers). *Decision:* **integrated.** Near-no-op on real
-teams by design; the mechanism only bites where it should.
+*Final:* `DEF_RATING` is **dropped** from the fictional path. All routes failed for
+one structural reason — it is opponent-dependent, and defense is largely composed
+of events that *don't* happen (a shot not taken, a drive abandoned) while a box
+score records events that do. The resulting ~7.6-win aggregated MAE is accepted as
+an honest floor. (`train_model.py` also excludes it, so both paths share one
+feature set.)
 
-**Usage→efficiency response.** Tested whether a player's shooting efficiency
-(TS%) can be adjusted for a change in usage rate, using real "situation-change"
-season pairs (player traded, or a high-usage teammate arrived/left) to isolate
-externally-caused usage shifts. Split by an on-ball/off-ball index (tracking-stat
-derived). *Evidence:* the effect is **real but weak, and only for off-ball
-players** — off-ball slope significant (usage down → efficiency up, p ≈ 0.005) but
-low-signal (R² ≈ 0.08); on-ball slope indistinguishable from zero (p ≈ 0.61).
-A continuous-slope variant did not beat the two-bucket split. Per-player
-predictions are near coin-flips; the model's value, if any, is only at the roster
-average. *Decision:* **not integrated.** The signal is too weak to justify wiring
-into the prediction, and any five-star roster forces usage swings far beyond the
-observed data range (predictions there run entirely on the extrapolation taper).
-Kept as a documented experiment in `player_efficiency.py`.
+### Possession conservation
 
-**Perturbation test replacing MAPE×coefficient error-impact ranking.** The old
-`error_impact()` (crossing per-feature aggregation MAPE with the ridge model's
-standardized coefficients) is unreliable under collinearity: PACE and POSS
-correlate at ~0.99 with large, opposite-signed coefficients (PACE ≈ -0.29,
-POSS ≈ +0.13), so a coefficient's raw magnitude overstates how much *that
-feature's own* error moves a prediction. *Approach:* `perturbation_impact()`
-instead perturbs each feature by its own measured MAPE (both directions),
-re-predicts with the fitted model, and averages the resulting win-count
-change over all 30 teams. *Evidence:* the two rankings disagree most exactly
-where predicted — PACE and DREB_PCT swap rank by 7-9 places between the two
-methods. *Decision:* **perturbation_impact() is now primary**; the old
-function is kept as `error_impact_deprecated()` so both print side by side.
-Both now live in `perturbation_tests.py` rather than inline in
-`aggregate_team.py` — the tests themselves are unchanged (verified: the full
-`python aggregate_team.py` output is byte-identical before and after the move,
-and the standalone `python perturbation_tests.py` prints the same section).
-Known limitation of the new diagnostic too: it perturbs one feature at a
-time, which assumes independent feature errors — false here, since PACE,
-POSS, FGA, and PTS errors all originate in the same usage-scaling step.
+*Problem.* Summing five players' box-score volume can imply more possessions than
+a game contains — the five-star roster implies ~181 against a real ~99.
+*Approach.* Anchor the roster to a possession target = minutes-weighted average of
+the players' own `PACE` (validated: tracks real team `PACE` at ~1.4% mean abs
+error, corr 0.985), then scale volume to match, deriving `POSS` from the scaled
+totals rather than setting it independently. *Evidence:* possession-denominated
+rates (`OFF_RATING`, `TM_TOV_PCT`) are provably invariant to the scaling (ON vs OFF
+differ by ~1e-14), so the mechanism adjusts volume without distorting efficiency;
+`usage_scale` ≈ 1.0 on real teams (mean 1.0006) and **0.55** on the five-star
+roster. *Decision:* **integrated.** A near-no-op on real teams by design; it bites
+only where it should.
 
-**5-man lineup validation (vs. the existing 15-man team validation).** The
-15-man validation (`aggregate_team.py` rebuilding a real team from its own
-top-15-by-minutes roster) is the wrong shape to trust: this program is
-actually asked to score 5-15 players, most often 5, not a full team
-rotation. *Approach:* `pull_lineups.py` pulls every real 5-man lineup's own
-observed Base + Advanced line (`lineup_season_stats.csv`, 2014-15 onward,
-23,470 lineup-seasons); for each lineup clearing a 250-total-possession floor
-(chosen from the pulled data's own distribution — median lineup-season is
-only ~45 possessions, 250 sits around the 95th percentile, roughly each
-team's handful of most-used units per season), its five players' own season
-stats are run through `aggregate_team()` and compared to the lineup's real
-line, weighted by possessions (827 of 1,005 qualifying lineups used; 178
-skipped for the traded-player caveat — a player's `player_all_seasons.csv`
-row reflects only their final team of the season, which can differ from the
-lineup's team). *First pass, naive comparison:* rate-like features
-(OFF_RATING, EFG_PCT, AST_TO, AST_RATIO, TM_TOV_PCT, OREB_PCT, DREB_PCT, PACE)
-validated fine (single digits to ~20% weighted MAPE), but every additive
-box-score total, plus POSS, ballooned to 300-460% weighted MAPE. Root cause:
-`aggregate_team()` rescales a roster to `TOTAL_TEAM_MINUTES` (240 = a full,
-uninterrupted 48-minute game — SPEC.md's deliberate premise that a fictional
-roster plays the whole game without substitution), while a real 5-man
-lineup's own recorded line covers only the ~15-20 partial minutes/game that
-exact five actually shared the floor before a substitution — two bases that
-aren't commensurable for anything that scales with minutes played. The
-15-man validation never surfaced this because a real team's top-15-by-minutes
-roster already sums to ~240 combined minutes on its own (`usage_scale` ≈ 1.0
-there), making the rescale nearly a no-op — it only bites at the roster size
-(5) this program actually predicts. *Fix:* rather than change
-`aggregate_team()`'s total-minutes assumption (which would fix the box-score
-totals but not POSS/PACE — `aggregate_team()` derives POSS from PACE, already
-a per-48-minutes quantity independent of total minutes), `validate_against_lineups()`
-rescales the real lineup's own line up to a 48-minute-equivalent basis
-(`48 / row["MIN"]`) before comparing — extrapolating "what this lineup's own
-box score would look like over a full 48 minutes at its own on-court rate,"
-the same quantity `aggregate_team()` is built to produce. Rate/percentage
-columns are left as-is (already floor-time-invariant). *Evidence after the
-fix:* overall weighted MAPE dropped from **276.70% to 10.33%**; POSS now
-tracks PACE closely (1.81% vs. 1.72%), confirming both are on the same basis.
-FTM, FTA, BLKA, PFD, and BLK still validate meaningfully worse at 5-man than
-15-man (~18-24% vs. ~3-6%) — these are exactly the lower-frequency events
-(free throws, blocks) where a 5-player sample is noisiest, a real remaining
-signal rather than a units artifact. *Decision:* **rescale integrated** into
-`validate_against_lineups()`; see Limitations for what the residual 5-man-vs-
-15-man gap in low-frequency stats means for a fictional prediction.
+*Known asymmetry.* `usage_scale` applies to `USAGE_SCALE_COLS` only, so `DREB`,
+`REB`, `STL`, `BLK` and `PF` take the 240-minute rescale without the pullback.
+`PFD` was moved into the scaled family after `FTA`/`PFD` came out at 0.710 against
+a real-team range of 0.953–1.303 — a foul drawn is what creates a free throw. The
+rest were left alone as genuinely opponent-driven.
 
-**5-man lineup DEF_RATING from players' prior-season stats
-(`lineup_defense_model.py`).** The fourth and most careful attempt at the
-DEF_RATING problem. The three earlier ones (sub-model, personal composite,
-awards composite) all either failed or only "worked" by borrowing the real,
-current-season, on-court DEF_RATING of the team being predicted. *Approach:*
-predict a real 5-man lineup's own observed DEF_RATING from its five players'
-**prior-season** individual stats — a 2023-24 lineup described only by its
-players' 2022-23 lines, which makes it causally impossible for a feature to
-contain the target — with **all on-court team context forbidden from every
-season** (player DEF/OFF/NET_RATING, PLUS_MINUS, any on/off split; PIE and
-USG_PCT are also excluded as not cleanly "his own"). Features: own box score
-(BLK, STL, DREB, OREB, PF, PFD, BLKA per 36), own rebound rates, closest-
-defender tracking (opponent FG% and its league-baseline delta), height, weight,
-age, MIN, GP, position counts, and prior-season roster continuity — 32 features,
-27 after pruning. Possession-weighted throughout.
+### Usage→efficiency response
 
-*Feature construction.* Five players are an unordered set, so features are
-pooled, not concatenated by slot. Two things fell out of doing that honestly:
-at a fixed group size of five a **sum is exactly 5× the mean**, so including
-both would make the design matrix exactly singular (mean only is kept); and
-pooling is order-free in exact arithmetic but *not* bit-identical in floating
-point, so each lineup's players are sorted by `PLAYER_ID` before aggregating.
-`test_permutation_invariance()` shuffles all five slots in every row and asserts
-the feature matrix is **byte-identical** — it passes (999 of 1,005 rows actually
-reordered at the primary floor). Order statistics (max/min/std of `BLK_36`,
-`STL_36`, `DREB_PCT`, height) sit on top of the means, since a mean hides "this
-lineup has one elite rim protector."
+*Tested.* Whether TS% can be adjusted for a usage change, using situation-change
+season pairs (traded, or a high-usage teammate arrived/left) to isolate
+externally-caused shifts, split by an on-ball/off-ball tracking index.
+*Evidence:* real but weak, and **only for off-ball players** — off-ball slope
+significant (usage down → efficiency up, p ≈ 0.005) but low-signal (R² ≈ 0.08);
+on-ball slope indistinguishable from zero (p ≈ 0.61). Per-player predictions are
+near coin-flips. *Decision:* **not integrated.** Any five-star roster forces usage
+swings far beyond the observed range, where predictions run entirely on the
+extrapolation taper. Kept as a documented experiment.
 
-**Sample-weight scale silently disabled the ridge penalty.** *Found:* RidgeCV
-was selecting α = 1000 — exactly the top of `train_model.py`'s
-`logspace(-3, 3, 25)` grid — and Ridge and OLS agreed to three decimals. Both
-were symptoms of one bug. sklearn's ridge objective is
-`Σ wᵢ(yᵢ − xᵢ·β)² + α‖β‖²`, so weights and penalty share a scale; weights were
-being passed as **raw season-total possessions** (mean ≈ 550 at the primary
-floor), which multiplies the data term by ~550 and therefore divides the
-effective penalty by ~550. α = 1000 was really acting like α ≈ 2 — an
-essentially unregularized fit, which is why "Ridge ≈ OLS" looked like evidence
-of a robust signal and was nothing of the kind. *Fix:* mean-normalize the
-weights (relative weighting, and so every possession-weighted metric, is
-unchanged) and extend the grid to `logspace(-3, 6, 40)`. *Evidence after the
-fix:* α lands at 41–346 across folds and floors — strictly **interior** to the
-grid every time — and ridge now actually shrinks: `‖ridge coef‖ / ‖OLS coef‖`
-= 0.78 → 0.16 as the possession floor rises and rows get scarcer, exactly the
-direction more shrinkage should move. It also changed the ranking: Ridge now
-beats OLS at every floor on the headline metric (season-centered R² 0.058 vs
-0.003 at floor 250), where before they were indistinguishable. *Standing rule:*
-a CV-selected hyperparameter pinned to a grid endpoint is a bug report, not a
-result.
+*Why the effect is small for everyone, which strengthens the decision:* the
+rosters with the largest usage cuts are ball-dominant (five guards at
+`usage_scale` 0.550) and sit in the **on-ball** bucket where the slope is null;
+the rosters in the off-ball bucket where the slope is real have little usage to
+lose (five shooters at 0.853). Big drops where there's no slope, real slope where
+there's no drop.
 
-**Rolling-origin CV replaced the single 2-season holdout.** *Why:* the old
-evaluation trained on 10 of 12 seasons and reported one number from ~160
-lineups. With correlated rows (see Limitations) that is one season's weather,
-not a measurement — and several conclusions drawn from it did not survive.
-*Approach:* expanding chronological window, never shuffled — fold 1 trains
-2014-15..2019-20 and tests 2020-21, fold 2 adds 2020-21 to training and tests
-2021-22, out to 2025-26; six held-out seasons, ~340–3,200 out-of-fold lineups
-depending on floor. 95% CIs are computed **across folds** (t, df = 5), not by
-bootstrapping rows: lineups inside a team-season share four of five players, so
-a row bootstrap would be anti-conservative.
+### Perturbation test replacing the MAPE × coefficient ranking
 
-*Headline metric is the season-centered target.* League-average team DEF_RATING
-rose **104.7 → 114.7** across the sample, so a raw-target R² is largely being
-charged for a league-wide scoring-environment shift that has nothing to do with
-which five players are on the floor (the constant baseline's raw-target bias is
-−2.5 to −4.8 points depending on floor). Centering on the season's league
-average and scoring back in raw points isolates the lineup question; using it in
-production requires forecasting next season's league average separately, which
-is a one-number league-level problem the raw model tries to do implicitly and
-badly.
+*Problem.* The old `error_impact()` crossed per-feature aggregation MAPE with
+standardized ridge coefficients. Unreliable under collinearity: `PACE` and `POSS`
+correlate at ~0.99 with large opposite-signed coefficients, so a coefficient's
+magnitude overstates how much *that feature's own* error moves a prediction.
+*Approach.* `perturbation_impact()` perturbs each feature by its measured MAPE
+(both directions), re-predicts, and averages the win-count change over all 30
+teams — model-agnostic, so it survives the logit target and would survive a
+nonlinear model. *Evidence:* the rankings disagree exactly where predicted, `PACE`
+and `DREB_PCT` swapping 7–9 places. `OREB_PCT` has the worst MAPE (25%) but ranks
+13th, while `PACE` at 1.35% ranks first — because `PACE`'s spread across real teams
+is tiny, so a small percentage error is a large z-score. *Decision:*
+`perturbation_impact()` is primary; the old function is kept as
+`error_impact_deprecated()` so both print side by side. *Known limitation:* it
+perturbs one feature at a time, assuming independent errors — false here, since
+`PACE`, `POSS`, `FGA` and `PTS` errors all originate in the same usage-scaling
+step.
 
-*Possession floor, re-picked under the CV folds* (Ridge, season-centered, best
-model at every floor):
+### 5-man lineup validation (vs. the 15-man team validation)
 
-| POSS floor | lineups (OOF) | R² ceiling | R² mean [95% CI] | share of ceiling | MAE gain vs const | team slope | team R² | team-seasons | team MAE (cal.) vs league avg |
-|---:|---:|---:|:--|---:|---:|---:|---:|---:|:--|
-| 50  | 6,446 (3,177) | 0.167 | **+0.026 [+0.016, +0.037]** | 0.158 | 0.179 | 0.716 | 0.218 | 179 | 2.24 vs 2.23 (worse) |
-| 100 | 2,621 (1,227) | 0.227 | +0.035 [−0.003, +0.073] | 0.153 | 0.169 | 0.712 | 0.224 | 166 | 2.17 vs 2.19 |
-| 200 | 1,047 (477)   | 0.285 | +0.058 [−0.005, +0.120] | **0.202** | 0.200 | 0.708 | 0.234 | 142 | 2.05 vs 2.11 |
-| 250 |   757 (335)   | 0.330 | +0.058 [−0.006, +0.122] | 0.176 | **0.202** | 0.705 | **0.240** | 133 | **1.96 vs 2.07** |
+*Why.* The 15-man validation rebuilds a real team from its top-15-by-minutes
+roster, but the program is asked to score 5–15 players, most often 5.
+*Approach.* `pull_lineups.py` pulls every real 5-man lineup's own observed line
+(23,470 lineup-seasons, 2014-15 onward); each lineup clearing a 250-possession
+floor has its five players' season stats run through `aggregate_team()` and
+compared to the lineup's real line, possession-weighted (827 of 1,005 qualifying
+lineups used; 178 skipped for the traded-player caveat).
 
-*Evidence:* the trade is not "more data is better." At 50 possessions ~83% of
-the label's variance is sampling noise, and that floor's team-level estimate is
-**no better than predicting the league average** (2.24 vs 2.23) — its extra
-rows are mostly noise rows. Higher floors win on lineup-level R², on share of
-the achievable ceiling, and on the team-level numbers the estimate would
-actually be used through. *Decision:* `PRIMARY_POSS_FLOOR = 250`, chosen on the
-team-level column; floor 200 is statistically indistinguishable with 42% more
-held-out lineups and is the conservative alternative. Two caveats kept in view:
-above floor 50 the lineup-level CI **includes zero** (only floor 50's small
-effect is separable from zero across folds), and a high floor leaves fewer
-team-seasons with any qualifying lineup (133 of 180 vs 179), so its calibration
-is fit on a self-selected set of stable rotations.
+*First pass:* rate features validated fine but every additive box-score total plus
+`POSS` ballooned to 300–460% weighted MAPE. *Root cause:* `aggregate_team()`
+rescales to a full 48-minute game while a real lineup's line covers only the
+~15–20 minutes those five actually shared the floor — two incommensurable bases.
+The 15-man validation never surfaced it because a real team's top-15 already sums
+to ~240 combined minutes, making the rescale nearly a no-op; it only bites at the
+roster size the program actually predicts. *Fix:* rescale the real lineup's line
+up to a 48-minute-equivalent basis (`48 / MIN`), leaving rate columns alone.
+*Evidence:* overall weighted MAPE **276.70% → 10.33%**, and `POSS` now tracks
+`PACE` closely (1.81% vs 1.72%). `FTM`, `FTA`, `BLKA`, `PFD` and `BLK` still
+validate worse at 5-man than 15-man (~18–24% vs ~3–6%) — the low-frequency events
+where a 5-player sample is noisiest, a real remaining signal rather than a units
+artifact. *Decision:* **rescale integrated.**
 
-*Model comparison* (floor 250, six folds, identical features/weights,
-season-centered target, MAE in DEF_RATING points):
+### 5-man lineup `DEF_RATING` from players' prior-season stats
 
-| Model | R² mean [95% CI] | worst fold | best fold | MAE | pooled-OOF R² |
-|-------|:--|---:|---:|---:|---:|
-| **Ridge** (α 70–346, interior) | **+0.058 [−0.006, +0.122]** | −0.027 | +0.141 | **4.52** | **+0.096** |
-| OLS | +0.003 [−0.111, +0.117] | −0.131 | +0.153 | 4.66 | +0.048 |
-| Gradient boosting (defaults) | −0.066 [−0.152, +0.020] | −0.165 | +0.063 | 4.82 | −0.026 |
-| Baseline: constant (league avg) | −0.009 | −0.036 | −0.000 | 4.73 | +0.025 |
-| Baseline: BLK+STL+DREB sum | −0.005 | −0.034 | +0.020 | 4.75 | +0.028 |
+The fourth and most careful `DEF_RATING` attempt, under a construction that makes
+the earlier attempts' circularity *causally impossible*.
 
-*Evidence:* ridge is the model — the honest ordering only became visible after
-the weight fix. The naive blocks+steals+rebounds sum is worth **nothing** over a
-constant, a useful negative result about the raw defensive box score. Gradient
-boosting is negative on 4 of 6 folds; it had a real chance here (~10× the team
-model's rows, and rim protection is where threshold effects would live), was fit
-at sklearn defaults with no tuning, and lost anyway — the same way it lost for
-the team model.
+*Approach.* Predict a real lineup's observed `DEF_RATING` from its five players'
+**prior-season** individual stats — a 2023-24 lineup described only by 2022-23
+lines — with **all on-court team context forbidden from every season** (player
+DEF/OFF/NET_RATING, `PLUS_MINUS`, on/off splits; `PIE` and `USG_PCT` also excluded
+as not cleanly "his own"). 32 features, 27 after pruning, possession-weighted
+throughout. Two rules, because they close different channels: the lag closes the
+mechanical channel (a feature containing the label), the context ban closes the
+confounding channel (a feature proxying for the label through a persistent team
+scheme).
+
+*Feature construction.* Five players are an unordered set, so features are pooled,
+not concatenated by slot. At a fixed group size of five a **sum is exactly 5x the
+mean**, so including both would make the design matrix exactly singular (mean only
+is kept); and pooling is order-free in exact arithmetic but *not bit-identical* in
+floating point, so players are sorted by `PLAYER_ID` first.
+`test_permutation_invariance()` shuffles all five slots and asserts the feature
+matrix is **byte-identical** — it passes (999 of 1,005 rows actually reordered).
+Order statistics (max/min/std of `BLK_36`, `STL_36`, `DREB_PCT`, height) sit on top
+of the means, since a mean hides "this lineup has one elite rim protector."
+
+**Sample-weight scale silently disabled the ridge penalty.** *Found:* RidgeCV was
+selecting α = 1000 — exactly the top of `train_model.py`'s grid — and Ridge and OLS
+agreed to three decimals. One bug caused both. sklearn's objective is
+`Σ wᵢ(yᵢ − xᵢ·β)² + α‖β‖²`, so weights and penalty share a scale; weights were raw
+season-total possessions (mean ≈ 550), multiplying the data term by ~550 and
+dividing the effective penalty by the same. α = 1000 was acting like α ≈ 2 — an
+essentially unregularized fit, which is why "Ridge ≈ OLS" looked like evidence of
+a robust signal and was nothing of the kind. *Fix:* mean-normalize the weights
+(relative weighting, and every weighted metric, unchanged) and extend the grid to
+`logspace(-3, 6, 40)`. *After:* α lands at 41–346, strictly **interior** every
+time, and ridge actually shrinks (`‖ridge‖/‖OLS‖` 0.78 → 0.16 as the floor rises).
+It also reversed the ranking — Ridge now beats OLS at every floor.
+***Standing rule:* a CV-selected hyperparameter pinned to a grid endpoint is a bug
+report, not a result.**
+
+**Rolling-origin CV replaced the single 2-season holdout.** The old evaluation
+trained on 10 of 12 seasons and reported one number from ~160 lineups — one
+season's weather, not a measurement, and three conclusions drawn from it did not
+survive. *Approach:* expanding chronological window, never shuffled — fold 1 trains
+2014-15..2019-20 and tests 2020-21, out to 2025-26. 95% CIs are computed **across
+folds** (t, df = 5), not by bootstrapping rows: lineups within a team-season share
+four of five players, so a row bootstrap would be anti-conservative.
+
+*Headline metric is the season-centered target.* League-average team `DEF_RATING`
+rose **104.7 → 114.7** across the sample, so a raw-target R² is largely charged for
+a league-wide scoring shift unrelated to which five players are on the floor.
+Centering isolates the lineup question; using it in production would require
+forecasting next season's league average separately.
+
+*Possession floor, re-picked under the CV folds* (Ridge, season-centered):
+
+| POSS floor | lineups (OOF) | R² ceiling | R² mean [95% CI] | team slope | team-seasons | team MAE (cal.) vs league avg |
+|---:|---:|---:|:--|---:|---:|:--|
+| 50 | 6,446 (3,177) | 0.167 | **+0.026 [+0.016, +0.037]** | 0.716 | 179 | 2.24 vs 2.23 (worse) |
+| 100 | 2,621 (1,227) | 0.227 | +0.035 [−0.003, +0.073] | 0.712 | 166 | 2.17 vs 2.19 |
+| 200 | 1,047 (477) | 0.285 | +0.058 [−0.005, +0.120] | 0.708 | 142 | 2.05 vs 2.11 |
+| 250 | 757 (335) | 0.330 | +0.058 [−0.006, +0.122] | 0.705 | 133 | **1.96 vs 2.07** |
+
+*Evidence:* more data is not simply better — at floor 50 roughly 83% of the
+label's variance is sampling noise and the team-level estimate is **no better than
+predicting the league average**. *Decision:* `PRIMARY_POSS_FLOOR = 250`, chosen on
+the team-level column; floor 200 is statistically indistinguishable with 42% more
+held-out lineups and is the conservative alternative. Two caveats: above floor 50
+the lineup-level CI **includes zero**, and a high floor leaves 133 of 180
+team-seasons, so the calibration is fit on a self-selected set of stable rotations.
+
+*Model comparison* (floor 250, six folds, season-centered, MAE in `DEF_RATING`
+points):
+
+| Model | R² mean [95% CI] | worst fold | MAE | pooled-OOF R² |
+|---|:--|---:|---:|---:|
+| **Ridge** (α 70–346, interior) | **+0.058 [−0.006, +0.122]** | −0.027 | **4.52** | **+0.096** |
+| OLS | +0.003 [−0.111, +0.117] | −0.131 | 4.66 | +0.048 |
+| Gradient boosting (defaults) | −0.066 [−0.152, +0.020] | −0.165 | 4.82 | −0.026 |
+| Baseline: constant (league avg) | −0.009 | −0.036 | 4.73 | +0.025 |
+| Baseline: BLK+STL+DREB sum | −0.005 | −0.034 | 4.75 | +0.028 |
+
+The naive blocks+steals+rebounds sum is worth **nothing** over a constant — a
+useful negative result about the raw defensive box score. GB is negative on 4 of 6
+folds despite ~10x the team model's rows and a domain where threshold effects
+should live. The lesson from both GB losses: what matters is *signal* per
+parameter, not rows per parameter, and 67–83% of this label is noise.
 
 *Roster continuity: a null, and a retraction.* The single-holdout run had shown
 continuity lineups defending ~1.5 points better than their players' prior stats
-predict and reshuffled ones ~1.1 points worse (a 2.7-point bias spread), which
-looked like a real chemistry effect worth modeling. *Approach:*
-`CONTINUITY_PAIR_FRAC` — of the 10 pairs among five players, the fraction who
-ended the prior season on the same team. Prior-season membership only: no
-minutes-together, no current-season performance, nothing dated after the roster
-is known, so it is computable before a season starts and for a roster that has
-never played (a cross-era fictional five scores 0.0). *Evidence:* the feature is
-a **null** — ridge coefficient −0.073 DEF_RATING points per SD, season-centered
-R² 0.058 with it vs 0.057 without. And the effect it was built for largely
-**was not there**: under rolling-origin CV the group bias spread is 0.99 points,
-not 2.7, and the MAE gap *reverses sign* — mover lineups are predicted **better**
-(MAE 4.35 vs 4.72, R² 0.122 vs 0.050), not worse. Adding continuity narrows the
-bias spread 0.99 → 0.89; a per-group intercept (a diagnostic refit that uses
-current-season team identity and is deliberately not a model feature) gets it to
-0.79 and moves the MAE gap by 0.001, so what remains is a small level effect
-with **no sign of context memorization** — a model leaning on "this team defends
-well" would have been much more accurate on the continuity group, and is the
-opposite. *Decision:* kept (it costs nothing and is the right shape for the
-question), but recorded as a null rather than the fix it was meant to be, and
-the earlier 2.7-point continuity claim is **withdrawn as single-holdout noise**.
+predict and reshuffled ones ~1.1 worse — a 2.7-point bias spread that looked like a
+real chemistry effect. `CONTINUITY_PAIR_FRAC` (of the 10 pairs among five players,
+the fraction who ended the prior season on the same team — membership only, so it
+is computable for a roster that never played) is a **null**: coefficient −0.073
+points per SD, R² 0.058 with it vs 0.057 without. And the effect it was built for
+largely **was not there** — under CV the bias spread is 0.99 points, not 2.7, and
+the MAE gap *reverses sign* (mover lineups predicted **better**, 4.35 vs 4.72). A
+per-group intercept moves the gap by 0.001, so there is no sign of context
+memorization. *Decision:* kept (it costs nothing and is the right shape for the
+question) but recorded as a null; the 2.7-point claim is **withdrawn as
+single-holdout noise**.
 
-*Per-feature sensitivity, then pruning.* `perturbation_impact()` here is the
-same diagnostic as `perturbation_tests.py`'s, with each feature moved ±1 SD
-instead of by an aggregation MAPE (there is no aggregation step to measure) and
-the output in DEF_RATING points rather than wins. Top of the ranking:
-`BLKA_36_mean` (0.44 pts/SD), `PCT_PLUSMINUS_mean` (0.35), `BLK_36_min` (0.32),
-`BLK_36_max` (0.27), `BLK_36_mean` (0.27), `STL_36_mean` (0.25) — shot-blocking
-and closest-defender columns, which is the right shape for a defensive model;
-bottom: `DREB_PCT_max`, `MIN_mean`, height min/std, `DREB_36_mean`. Pruning the
-three collinear blocks the coefficient table exposed (the offsetting
-`OREB_36_mean` / `OREB_PCT_mean` pair; `PCT_PLUSMINUS_mean`, mechanically
-`D_FG_PCT − NORMAL_FG_PCT`; the `DREB_PCT` std/max/min triple collapsed to
-`DREB_PCT_max`) took 32 features to 27 with Ridge season-centered R² 0.058 →
-0.051 → 0.048 → 0.051. *Evidence:* pruning is a **wash to slightly negative** —
-every step is far inside the ±0.06 CI, and ridge was already handling the
-collinearity (that is what the L2 penalty is for). *Decision:* keep the pruned
-27-feature set on parsimony grounds, with the ~0.007 R² cost recorded rather
-than presented as an improvement.
+*Sensitivity, then pruning.* Top of the ±1-SD ranking: `BLKA_36_mean` (0.44
+pts/SD), `PCT_PLUSMINUS_mean` (0.35), `BLK_36_min` (0.32), `BLK_36_max` (0.27),
+`BLK_36_mean` (0.27), `STL_36_mean` (0.25) — shot-blocking and closest-defender
+columns, the right shape for a defensive model. Pruning the three collinear blocks
+the coefficient table exposed took 32 features to 27 with R² 0.058 → 0.051. *A
+wash to slightly negative*, every step far inside the ±0.06 CI — ridge was already
+handling the collinearity, which is what L2 is for. *Decision:* keep the 27-feature
+set on parsimony grounds, with the ~0.007 cost recorded rather than presented as an
+improvement.
 
-*Reliability / calibration (required for integration).* Out-of-fold predictions
-from all six held-out seasons, rolled up to team level (possession-weighted),
-regressed as true team DEF_RATING on the estimate, 133 held-out team-seasons:
+*Reliability / calibration (required before integration).* Out-of-fold predictions
+from all six held-out seasons, rolled up to team level, regressing true team
+`DEF_RATING` on the estimate, 133 team-seasons:
 
-| Model / target | slope | intercept | R² | sd(est) | sd(true) | team MAE raw → calibrated | league-avg baseline |
-|---|---:|---:|---:|---:|---:|:--|---:|
-| **Ridge, season-centered** | **0.679** | **37.85** | **0.233** | 2.00 | 2.82 | 2.93 → **1.98** | 2.07 |
-| OLS, season-centered | 0.483 | 59.40 | 0.202 | 2.62 | 2.82 | 3.10 → 2.01 | 2.07 |
-| Ridge, raw target | 0.493 | 59.62 | 0.173 | 2.37 | 2.82 | 5.28 → 2.06 | 2.07 |
-| OLS, raw target | 0.389 | 70.61 | 0.151 | 2.81 | 2.82 | 4.79 → 2.09 | 2.07 |
+| Model / target | slope | R² | team MAE raw → cal. | league-avg baseline |
+|---|---:|---:|:--|---:|
+| **Ridge, season-centered** | **0.679** | 0.233 | 2.93 → **1.98** | 2.07 |
+| OLS, season-centered | 0.483 | 0.202 | 3.10 → 2.01 | 2.07 |
+| Ridge, raw target | 0.493 | 0.173 | 5.28 → 2.06 | 2.07 |
 
-`DRtg_used = 37.85 + 0.679 × DRtg_estimated` is the number a margin-based win
-model would have to apply. *Evidence:* the shrinkage is much less severe than
-the 0.394 the buggy-ridge single-holdout run reported, and the slope is
-remarkably stable across possession floors (0.705–0.716 for the unpruned fit at
-every floor), which is what a real coefficient looks like. R² 0.233 of
-between-team defensive variance, out of sample, from player stats that predate
-the season and contain no team context, is a genuine result — for scale, the
-DEF_RATING sub-model rejected earlier in this log managed R² ≈ 0.19 using the
-*current* season's box score. *But* R² 0.233 only cuts the residual SD by ~12%,
-so at team level the calibrated estimate beats "just predict the league average"
-by 1.98 vs 2.07 points of MAE — about 4%. *Decision:* still **not integrated.**
-The estimate is real, is now honestly calibrated, and is not yet worth a
-feature: 4% of team-level MAE cannot carry the weight of replacing a dropped
-column that the win model treats as one of its two dominant drivers. The
-slope/intercept above are what a future integration must apply.
+`DRtg_used = 37.85 + 0.679 × DRtg_est` is what a future integration must apply,
+and the slope is stable across floors (0.705–0.716), which is what a real
+coefficient looks like. *Read the R² with care — it uses the wrong baseline.*
+`r2_score` compares against the **pooled** mean, but those team-seasons span six
+seasons of ~5 points of league drift and the centered model adds each season's
+average back into every prediction, so part of 0.233 is credit for tracking drift.
+Against a per-season baseline the MAE ratio implies **R² ≈ 0.085**. The MAE
+comparison is the number to quote.
 
-*Hustle stats: null under CV.* Contested shots, deflections, defensive box-outs,
-charges drawn and loose balls exist only from 2016-17 (2015-16 returns a
-147-player, median-1-game partial season that looks like real data — see
-`pull_player_defense.py`), so using them costs the three oldest lineup seasons.
-On the identical reduced sample and identical folds: Ridge season-centered R²
-**0.030 [−0.224, +0.285] with** hustle vs **0.039 [−0.224, +0.303] without**,
-MAE 4.60 vs 4.58. *Decision:* **off by default**, kept behind `use_hustle` with
-the comparison printed every run. (The single-holdout run had made hustle look
-like a 0.23-point MAE gain on the raw target; under CV on the centered target it
-is nothing — another number that did not survive the better evaluation.)
+*Decision:* **not integrated.** 1.98 vs 2.07 is a 4% improvement — about **0.2
+wins** at ~2.5 wins per point of net rating — which cannot carry the weight of
+replacing a column the win model treats as one of its two dominant inputs.
+
+*Hustle stats: null under CV.* Contested shots, deflections, box-outs, charges and
+loose balls exist only from 2016-17 (2015-16 returns a 147-player, median-1-game
+partial season that *looks* like real data), so using them costs three lineup
+seasons. On the identical reduced sample and folds: R² **0.030 [−0.224, +0.285]
+with** hustle vs **0.039 [−0.224, +0.303] without**. *Decision:* **off by default**,
+with the comparison printed every run. (The single-holdout run had made hustle look
+like a 0.23-point gain — another number that did not survive.)
 
 *Rookies.* A lineup is dropped if any of its five players lacks a usable prior
-season, rather than imputed — imputing a league-average defender would inject a
-fabricated feature vector under a real label. This is the single largest sample
-cut: at floor 250, 230 of 1,005 lineups (23%) are dropped for a missing prior
-season and 18 more for a prior season below `MIN_GP`/`MIN_MPG` (at floor 50 it
-is 34%). See Limitations for the resulting bias.
+season, rather than imputed — a league-average defender would inject a fabricated
+feature vector under a real label. This is the largest sample cut: 230 of 1,005
+lineups (23%) at floor 250, 34% at floor 50. See Limitations for the resulting
+bias.
 
 ## Limitations & next steps
 
