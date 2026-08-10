@@ -3,7 +3,7 @@
 Predicts an NBA team's regular-season **win rate** from team-level statistics
 using machine learning, and — via a player-to-team aggregation layer — predicts
 the record a **fictional 5–15 player roster** (present or historic players) would
-post in today's NBA.
+post in **today's** NBA.
 
 ## Current status
 
@@ -215,64 +215,6 @@ Each entry: *what was tested → what the evidence showed → what was decided.*
 Decisions came from experiments, not intuition, and the ones that were reversed
 are marked rather than deleted.
 
-### Feature set for the fictional path — built, measured, reverted
-
-*Tested.* The 27-feature model's coefficients don't read as basketball:
-`OFF_RATING` **−0.877** log-odds per SD, `AST` −0.536, `TOV` **+0.550** — 7 of 16
-priced features backwards. The cause is exact linear dependency:
-
-```
-PTS  == 2*FGM + FG3M + FTM            (exact, max abs diff 4.3e-14)
-POSS ~= FGA + 0.44*FTA + TOV - OREB   (corr 0.988)
-REB  == OREB + DREB                   (exact)
-OFF_RATING == 100 * PTS / POSS        (corr 0.999981)
-```
-
-Ridge can't remove a dependency — it picks one of infinitely many equally-good
-coefficient splits, valid only where the dependency holds as it does in training.
-The hypothesis was that an aggregated roster breaks that, since usage conservation
-scales `PTS` while `POSS` is derived from the scaled totals.
-
-*Built.* A 12-column rates-and-defence set (`OFF_RATING`, `EFG_PCT`,
-`TM_TOV_PCT`, `AST_RATIO`, `OREB_PCT`, `DREB_PCT`, `PACE`, `STL`, `BLK`, `BLKA`,
-`PF`, `PFD`) with four sign assertions. Pruning only `PTS`/`POSS`/`REB` does **not**
-work — they're reconstructable from what remains, and `OFF_RATING` still fits at
-−0.40. The counting stats and the derived rates span the same space, so one whole
-side has to go.
-
-*Evidence.* It worked on its own terms — 0 of 11 signs wrong for 0.23 wins of
-holdout MAE. But scored against real teams' actual win totals from their own
-aggregated rosters, the only end-to-end validation available:
-
-| Feature set | Holdout MAE | R² | Aggregated rosters vs actual wins |
-|---|---:|---:|---:|
-| **27 (shipped)** | **4.85 W** | **0.813** | **7.6 W** |
-| 12 (reverted) | 5.08 W | 0.783 | 15.2 W |
-| variant: `DREB` for `DREB_PCT` | 3.97 W | 0.864 | 10.0 W |
-
-Twice as bad. Pruning 15 counting stats that aggregate at under 5% MAPE
-concentrates weight onto `DREB_PCT` (7.5% MAPE) and `OREB_PCT` (25.3%) — the two
-approximations the aggregation itself flags low-confidence. Stress rosters moved
-the same way: five All-Star guards 52-30 → 28-54, five elite shooters 11-71 →
-1-81.
-
-*And the one apparent win was an artifact.* The 12 seemed to fix the guard's
-always-fires problem (median ratio 1.70x → 1.08x, flagged 100% → 65%). But random
-12-column subsets of the same 27 score a median of **0.92x** — better than the
-deliberately chosen 12. Mahalanobis distance in 12 dimensions is smaller than in
-27 regardless of which 12.
-
-*Decision:* **reverted.** Theory and measurement disagreed and the measurement
-won. The residual defence — aggregated real rosters sit at 1.7x the guard limit
-while a cross-era five sits at 7–9x, so the test doesn't reach the real regime —
-is unfalsifiable and is recorded as an open question, not used to override a
-measurement. Kept from the experiment: `coefficient_signs()`, printed every run,
-asserting nothing. The `DREB` variant dominated the 12 on every axis and is the
-first thing to test if this is revisited (see Limitations).
-
-*Standing rule:* before believing a metric moved because of your change, build
-the cheapest null version of that change and check whether it moves anyway.
-
 ### `*_PCT` clipped to the contract, with the clip reported
 
 *Tested.* The contract requires every `*_PCT` output to be a fraction in [0, 1],
@@ -376,41 +318,6 @@ Expected: the logistic is near-linear across the band real teams occupy, so on
 real teams the transform has almost nothing to do. It earns its place at the
 extremes, which is the whole point of the program. *Decision:* **integrated.**
 
-*The cost of the fix, and the guard that pays it.* Bounding the output removes the
-tell — a win rate of 2.44 announces itself as nonsense, a clean-looking 82-0 does
-not. So `fit_extrapolation_guard()` measures Mahalanobis distance from the
-training centre on standardized features (Ledoit-Wolf shrunk purely for
-conditioning, since `PACE`/`POSS` correlate at ~0.99), with both thresholds read
-off the real teams rather than a chi-square table: `edge` = 5.78 (99th pct),
-`limit` = 6.36 (max). A per-feature bounding box would not do — an ordinary
-five-man rotation breaks exactly one feature's range while landing 2.1x out,
-because what's wrong with it is the *combination*.
-
-*Calibrating the threshold.* Walking the guard forward one season at a time (8
-folds, 240 unseen real teams), 4.2% of genuinely real teams stepped past the prior
-seasons' maximum, and the worst reached **1.13x**. So a ratio near 1.0 means "a
-team shape the league hadn't produced yet," and the flag's *magnitude* is the
-signal.
-
-*Evidence — the flag fires on everything, which is itself the finding.*
-
-| Row shape | ratio to `limit` | flagged |
-|---|---:|---:|
-| Real team-season the guard never saw | ≤ 1.13x | 4.2% |
-| Real team's own top-15 rotation, aggregated | 1.7x (max 2.4x) | **100%** |
-| Real team's own top-5 rotation, aggregated | 1.9x (max 3.3x) | **100%** |
-| Five-star roster, conservation ON | 5.1x | 100% |
-| Cross-era five-star roster | 6.4x | 100% |
-| Five-star roster, conservation OFF | 9.2x | 100% |
-
-Every roster that goes through `aggregate_team()` lands outside the real-team
-cloud — including a real team's own starting five, whose season actually happened.
-The aggregation displaces a line by itself, before any fictional-ness enters,
-mostly through the rescale to 240 minutes. *Decision:* keep the threshold defined
-by the 360 real teams, but report the **ratio** as the headline with the measured
-scale alongside, and record that the boolean is a constant on the roster path. A
-flag that always fires is worth nothing; a ratio separating an ordinary rotation
-(1.9x) from a stacked five (5.1x) is worth something.
 
 ### Ridge vs. gradient boosting (real-team model)
 
