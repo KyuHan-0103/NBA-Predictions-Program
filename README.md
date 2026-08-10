@@ -3,7 +3,7 @@
 Predicts an NBA team's regular-season **win rate** from team-level statistics
 using machine learning, and — via a player-to-team aggregation layer — predicts
 the record a **fictional 5–15 player roster** (present or historic players) would
-post in **today's** NBA.
+post in today's NBA.
 
 ## Current status
 
@@ -40,7 +40,7 @@ players and checking the result against the real team's line.
 
 It is scored by the same 27-feature model, on purpose: a smaller feature set
 built to make the coefficients read as basketball was tested and rejected for
-costing accuracy where it counts (Test log). Every prediction is reported with
+costing accuracy. Every prediction is reported with
 a **90% interval** whose two components are separated, and with an explicit
 note of the two terms that interval does *not* cover.
 
@@ -68,19 +68,35 @@ isn't re-litigated later.
 
 ## Project structure
 
+The main pipeline sits at the repo root. The two experiments that are documented
+but **not integrated** live in their own folders, alongside the data pulls that
+feed only them, so the root contains nothing the shipped pipeline doesn't use.
+
+```
+aggregate_team.py  train_model.py  perturbation_tests.py
+predict_fictional_roster.py
+pull_team_stats.py  pull_player_seasons_all.py  pull_lineups.py
+*.csv  README.md  SPEC.md  CLAUDE.md  AGGREGATION_CONTRACT.md  requirements.txt
+
+def_rating_testing/   lineup_defense_model.py, pull_player_defense.py
+usg_testing/          usage_efficiency_model.py, pull_player_history.py
+docs/                 pull_player_stats.py + the GP/MIN histograms it produces
+```
+
 | File | Purpose |
 |------|---------|
 | `pull_team_stats.py` | Pulls Base + Advanced team stats, merges on TEAM_ID + SEASON, converts counting stats to per-game, writes `team_season_stats.csv`. Data only. |
-| `pull_player_stats.py` | Pulls current-season per-player Base + Advanced stats → `player_season_stats.csv`. Data only. |
+| `docs/pull_player_stats.py` | **Exploratory, not in the pipeline.** Pulls current-season per-player stats → `player_season_stats.csv` and plots the GP / MIN histograms in `docs/` that `MIN_GP` and `MIN_MPG` were chosen from. Nothing else reads its CSV. Data only. |
 | `pull_player_seasons_all.py` | Pulls per-player stats for every season 1996-97 onward (the roster-input pool) → `player_all_seasons.csv`. Data only. |
 | `pull_lineups.py` | Pulls 5-man lineup stats (Base + Advanced), 2014-15 onward → `lineup_season_stats.csv`. Ground truth for `aggregate_team.py`'s 5-man validation. Data only. |
-| `pull_player_defense.py` | Pulls per-player *individual* defensive descriptors — bio (height/weight/age), closest-defender tracking (opponent FG% on shots he defended, 2013-14 onward), hustle (2016-17 onward) → `player_defense_stats.csv`. Data only. |
+| `def_rating_testing/pull_player_defense.py` | Pulls per-player *individual* defensive descriptors — bio (height/weight/age), closest-defender tracking (opponent FG% on shots he defended, 2013-14 onward), hustle (2016-17 onward) → `player_defense_stats.csv`. Data only. |
 | `train_model.py` | Loads the team CSV, splits by season, trains the ridge win-rate model on `logit(W_PCT)`, prints metrics and standardized coefficients (the model's top drivers). Also home to `logit`/`inv_logit`, `ridge_step()` (reaches the `RidgeCV` inside the target-transform wrapper), the extrapolation guard every roster prediction is reported against, and `prediction_interval()` / `interval_report()`. |
 | `aggregate_team.py` | Aggregates 5–15 players into one team stat-line (possession conservation, DEF_RATING dropped, `*_PCT` clipped to the contract), and self-validates by rebuilding every real team from its own roster. Also home to `coefficient_signs()` (expected vs. fitted signs, printed) and the stress rosters. |
 | `perturbation_tests.py` | The aggregation's per-feature error-impact diagnostics (`perturbation_impact()` + the deprecated MAPE × coefficient ranking), split out of `aggregate_team.py`. Runs standalone, and `aggregate_team.py` still prints the identical tests via `run_perturbation_tests()`. |
 | `predict_fictional_roster.py` | Interactive roster builder (by player + season); aggregates and scores the roster with the ridge model. |
-| `usage_efficiency_model.py` | **Standalone, not integrated.** Fits and tests the usage→efficiency (USG%→TS%) response model. Kept as a documented experiment. |
-| `lineup_defense_model.py` | **Standalone, not integrated.** Estimates a 5-man lineup's DEF_RATING from its players' prior-season individual stats (permutation-invariant pooling, possession-weighted, rolling-origin CV by season), with the possession-floor sweep, label-noise ceiling, both baselines, and the reliability / team-change diagnostics. Kept as a documented experiment. |
+| `usg_testing/pull_player_history.py` | Pulls player Advanced + tracking stats (2013-14 onward, the SportVU floor) → `player_history_stats.csv`. Feeds `usage_efficiency_model.py` only; nothing in the main pipeline reads it. Data only. |
+| `usg_testing/usage_efficiency_model.py` | **Standalone, not integrated.** Fits and tests the usage→efficiency (USG%→TS%) response model. Kept as a documented experiment. |
+| `def_rating_testing/lineup_defense_model.py` | **Standalone, not integrated.** Estimates a 5-man lineup's DEF_RATING from its players' prior-season individual stats (permutation-invariant pooling, possession-weighted, rolling-origin CV by season), with the possession-floor sweep, label-noise ceiling, both baselines, and the reliability / team-change diagnostics. Kept as a documented experiment. |
 | `SPEC.md` | Full project specification. |
 | `CLAUDE.md` | Working agreements, incl. the aggregation contract. |
 
@@ -91,15 +107,21 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
+# The scripts in def_rating_testing/, usg_testing/ and docs/ read and write CSVs
+# relative to the working directory, so run them from the repo root as below.
+
 python pull_team_stats.py            # team data      -> team_season_stats.csv
 python pull_player_seasons_all.py    # player pool    -> player_all_seasons.csv
 python pull_lineups.py               # 5 man lineups  -> lineup_season_stats.csv
-python pull_player_defense.py        # player defense -> player_defense_stats.csv
+python def_rating_testing/pull_player_defense.py   # player defense -> player_defense_stats.csv
 python train_model.py                # train + report the real-team model
 python aggregate_team.py             # aggregation + real-team validation
 python perturbation_tests.py         # aggregation error-impact diagnostics only
 python predict_fictional_roster.py   # build a roster and predict its record
-python lineup_defense_model.py       # 5-man lineup DEF_RATING experiment
+python def_rating_testing/lineup_defense_model.py  # 5-man lineup DEF_RATING experiment
+python usg_testing/pull_player_history.py         # tracking data for the usage experiment
+python usg_testing/usage_efficiency_model.py      # usage -> efficiency experiment
+python docs/pull_player_stats.py                  # optional: regenerate the GP/MIN histograms
 ```
 
 ## Configuration
@@ -109,9 +131,75 @@ Knobs live at the top of each script:
 - `NUM_SEASONS` — how many seasons of team data to pull (`pull_team_stats.py`)
 - `N_TEST_SEASONS` — recent seasons held out for testing (`train_model.py`)
 - `ALPHAS` — ridge penalty grid searched by cross-validation
-- `MIN_GP`, `MIN_MPG` — player eligibility thresholds derived from graphs in docs (`aggregate_team.py`)
+- `MIN_GP`, `MIN_MPG` — player eligibility thresholds, chosen from
+  `docs/2025-26 GP Histogram Distribution.png` and
+  `docs/2025-26 MIN Histogram Distribution.png` (`aggregate_team.py`)
 - `POSS_FLOORS`, `PRIMARY_POSS_FLOOR` — lineup possession floors compared, and the one chosen from that comparison (`lineup_defense_model.py`)
 - `MIN_TRAIN_SEASONS`, `LINEUP_ALPHAS` — first rolling-origin fold's training depth, and the ridge grid (deliberately wider than `train_model.py`'s — see Test log) (`lineup_defense_model.py`)
+
+## Reproducing the reported results
+
+Every number in this README comes from the committed CSVs, not from a live API
+call. **This matters more than the config constants below:** the NBA Stats API
+returns live data, so re-running `pull_team_stats.py` in a later season pulls a
+different 12 seasons and every reported figure shifts. The CSVs are committed for
+exactly this reason. Re-pull only when you intend the numbers to move.
+
+**Data snapshot the reported numbers come from**
+
+| File | Rows | Cols | Seasons |
+|---|---:|---:|---|
+| `team_season_stats.csv` | 360 | 33 | 2014-15 .. 2025-26 (12) |
+| `player_all_seasons.csv` | 14,569 | 29 | 1996-97 .. 2025-26 (30) |
+| `lineup_season_stats.csv` | 23,470 | 38 | 2014-15 .. 2025-26 (12) |
+| `player_defense_stats.csv` | 6,896 | 19 | 2013-14 .. 2025-26 (13) |
+| `player_season_stats.csv` | 582 | 42 | 2025-26 only |
+
+Note that `aggregate_team.py`'s and `perturbation_tests.py`'s own validation
+sections pull the **current** season's player stats live rather than from a CSV,
+so those two are the exception — their output moves as the season progresses.
+
+**Configuration that produces the reported figures**
+
+| Constant | Value | File | Controls |
+|---|---|---|---|
+| `NUM_SEASONS` | 12 | `pull_team_stats.py` | the 360 team-seasons everything is fit on |
+| `START_SEASON` | 1996-97 | `pull_player_seasons_all.py` | the roster-input pool |
+| `START_SEASON` | 2014-15 | `pull_lineups.py` | matches the team CSV's range |
+| `GROUP_QUANTITY` | 5 | `pull_lineups.py` | 5-man lineups |
+| `N_TEST_SEASONS` | 2 | `train_model.py` | the chronological holdout → **4.85 W / R² 0.813** |
+| `ALPHAS` | `logspace(-3, 3, 25)` | `train_model.py` | ridge grid (selected α sits interior) |
+| `LOGIT_EPS` | 1e-6 | `train_model.py` | poles clipped off `logit()`; never binds on real data |
+| `EDGE_QUANTILE` | 0.99 | `train_model.py` | guard `edge` = **5.78** (`limit` = **6.36**, the max) |
+| `MARGINAL_RATIO` | 1.15 | `train_model.py` | above this, the guard reports "unfamiliar", not "unsupported" |
+| `INTERVAL_Z` | 1.645 | `train_model.py` | the 90% interval |
+| `DEF_RATING_COST_WINS` | 2.3 | `train_model.py` | the uncovered term named next to every interval |
+| `GAMES_PER_SEASON` | 82 | both | win-rate → record |
+| `MIN_GP` | 5 | `aggregate_team.py` | eligibility (chosen from the histograms in `docs/`) |
+| `MIN_MPG` | 6 | `aggregate_team.py` | eligibility |
+| `TOTAL_TEAM_MINUTES` | 240.0 | `aggregate_team.py` | 5 x 48; the rescale the guard's displacement traces to |
+| `LINEUP_POSS_FLOOR` | 250 | `aggregate_team.py` | 5-man validation → **827 of 1,005** lineups used |
+| `PRIMARY_POSS_FLOOR` | 250 | `def_rating_testing/lineup_defense_model.py` | the defensive experiment's floor |
+| `MIN_TRAIN_SEASONS` | 6 | `def_rating_testing/lineup_defense_model.py` | first rolling-origin fold → 6 held-out seasons |
+| `LINEUP_ALPHAS` | `logspace(-3, 6, 40)` | `def_rating_testing/lineup_defense_model.py` | wider than `ALPHAS` on purpose (see Test log) |
+| `CI_LEVEL` | 0.95 | `def_rating_testing/lineup_defense_model.py` | across-fold CIs, t with df = 5 |
+
+**Environment.** `requirements.txt` bounds major versions rather than pinning
+exactly, so the install doesn't rot. The reported figures were produced on:
+
+```
+pandas 3.0.2    numpy 2.4.4    scikit-learn 1.8.0    scipy 1.17.1
+```
+
+Record your own with `pip freeze > requirements-lock.txt` before quoting numbers,
+since `RidgeCV`'s selected alpha and therefore the coefficients can move slightly
+across scikit-learn versions.
+
+**Expected output.** `python train_model.py` should print test R² 0.813, MAE
+0.0591 (4.85 wins), guard `edge` 5.78 / `limit` 6.36, and a selected alpha
+strictly inside the grid. If the alpha is pinned at either endpoint, that's a bug
+report rather than a result — see the Test log.
+
 
 ## Methodology
 
@@ -149,7 +237,7 @@ coefficients which only cancel in combination are unsafe on an extrapolated row
 — and **rejected**: it fixed the coefficient signs and made aggregated-roster
 predictions measurably worse (7.7 → 12.9 wins MAE), because pruning the
 well-aggregated counting stats concentrates weight onto the two rebound-share
-approximations this pipeline estimates worst. See the Test log.
+approximations this pipeline estimates worst.
 
 **Coefficient signs are printed, never asserted.** 7 to 8 of the 16 features
 with a defensible expected sign fit backwards — `OFF_RATING` at −0.88, `AST` at
@@ -318,6 +406,41 @@ Expected: the logistic is near-linear across the band real teams occupy, so on
 real teams the transform has almost nothing to do. It earns its place at the
 extremes, which is the whole point of the program. *Decision:* **integrated.**
 
+*The cost of the fix, and the guard that pays it.* Bounding the output removes the
+tell — a win rate of 2.44 announces itself as nonsense, a clean-looking 82-0 does
+not. So `fit_extrapolation_guard()` measures Mahalanobis distance from the
+training centre on standardized features (Ledoit-Wolf shrunk purely for
+conditioning, since `PACE`/`POSS` correlate at ~0.99), with both thresholds read
+off the real teams rather than a chi-square table: `edge` = 5.78 (99th pct),
+`limit` = 6.36 (max). A per-feature bounding box would not do — an ordinary
+five-man rotation breaks exactly one feature's range while landing 2.1x out,
+because what's wrong with it is the *combination*.
+
+*Calibrating the threshold.* Walking the guard forward one season at a time (8
+folds, 240 unseen real teams), 4.2% of genuinely real teams stepped past the prior
+seasons' maximum, and the worst reached **1.13x**. So a ratio near 1.0 means "a
+team shape the league hadn't produced yet," and the flag's *magnitude* is the
+signal.
+
+*Evidence — the flag fires on everything, which is itself the finding.*
+
+| Row shape | ratio to `limit` | flagged |
+|---|---:|---:|
+| Real team-season the guard never saw | ≤ 1.13x | 4.2% |
+| Real team's own top-15 rotation, aggregated | 1.7x (max 2.4x) | **100%** |
+| Real team's own top-5 rotation, aggregated | 1.9x (max 3.3x) | **100%** |
+| Five-star roster, conservation ON | 5.1x | 100% |
+| Cross-era five-star roster | 6.4x | 100% |
+| Five-star roster, conservation OFF | 9.2x | 100% |
+
+Every roster that goes through `aggregate_team()` lands outside the real-team
+cloud — including a real team's own starting five, whose season actually happened.
+The aggregation displaces a line by itself, before any fictional-ness enters,
+mostly through the rescale to 240 minutes. *Decision:* keep the threshold defined
+by the 360 real teams, but report the **ratio** as the headline with the measured
+scale alongside, and record that the boolean is a constant on the roster path. A
+flag that always fires is worth nothing; a ratio separating an ordinary rotation
+(1.9x) from a stacked five (5.1x) is worth something.
 
 ### Ridge vs. gradient boosting (real-team model)
 
@@ -596,24 +719,6 @@ bias.
 
 ## Limitations & next steps
 
-- **The coefficient signs are wrong and the fix cost more than it bought.** 7 of
-  16 priced features fit backwards (`OFF_RATING` −0.877, `AST` −0.536, `TOV`
-  +0.550) because collinear features carry offsetting values that cancel only
-  while they keep moving together. Real teams always satisfy that; an aggregated
-  roster is not guaranteed to. A feature set built to remove the problem was
-  tested and reverted for doubling the aggregated-roster error (Test log), so the
-  caveat stands **unresolved** and is printed with the coefficients on every run.
-  A better answer would improve the two rebound-share approximations first, which
-  would raise the ceiling on both feature sets at once.
-- **One measured configuration was never fully explored.** Swapping `DREB_PCT`
-  for `DREB` beat the reverted 12 on every axis (holdout 3.97 vs 5.08,
-  aggregated rosters 10.0 vs 15.2) and beat the shipped 27 on the holdout, losing
-  only on aggregated rosters (10.0 vs 7.6). It is a one-line change and the first
-  thing to test if anyone picks this up. Three concerns are unmeasured: `DREB` is
-  a count, so a cross-era roster carries its era's pace and era adjustment is
-  unbuilt; `DREB` takes the 240-minute rescale without the usage pullback; and
-  dropping `DREB_PCT` removes the five-centre clip as a visible red flag.
-
 - **No ground truth for the end goal.** Fictional/cross-era teams never played,
   so their predictions are informed estimates that can't be directly verified.
   The pipeline is graded only *indirectly*, on real teams.
@@ -639,9 +744,7 @@ bias.
   together. Real teams always satisfy that; an aggregated roster is not
   guaranteed to, and usage conservation deliberately breaks one of the
   relationships involved (it scales `PTS` while `POSS` is derived from the
-  scaled totals). A feature set built to remove the problem was rejected for
-  costing more accuracy than it bought (Test log), so the caveat stands
-  unresolved and is printed with the coefficients on every run.
+  scaled totals).
 - **The stress rosters expose two things the model gets wrong.** Five centres
   predicts 82-0 at a 9.2× extrapolation ratio, on `REB` and `DREB` totals from
   five great rebounders rescaled to 240 minutes, with `DREB_PCT` reaching the
